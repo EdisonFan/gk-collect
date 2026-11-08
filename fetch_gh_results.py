@@ -25,7 +25,7 @@ v4：本地 git 对象库优先 + 差集精确 refspec 增量补齐。
 
 数据安全性：结果在云端分支 + 制品双份存在，本地落盘是第三份。
 """
-import os, sys, json, subprocess
+import os, sys, json, subprocess, re, urllib.request
 
 REPO_SLUG = 'EdisonFan/gk-collect'
 REPO_DIR = '/workspace/gh-gk-collect'
@@ -89,29 +89,44 @@ def scan(verbose=True):
     return len(refs), replaced, total, skipped, failed
 
 
-def fetch_missing(chunk=50):
+def remote_shas():
+    """用 GitHub API 拿全部 cutoff-* 分支的 sha（实测约 2s）。
+
+    不用 `git ls-remote --heads ... 'refs/heads/cutoff-*'`：通配符会让服务端
+    协商 168 个 ref，跨境实测 120s 超时；而 API matching-refs 一次返回全部，
+    稳定 2s。这是「达标数卡住不涨」的直接原因之一。
+    """
+    tok = open('/workspace/.secrets/github_pat', encoding='utf-8').read().strip()
+    H = {'Authorization': 'Bearer ' + tok,
+         'Accept': 'application/vnd.github+json'}
+    url = ('https://api.github.com/repos/%s/git/matching-refs/heads/cutoff-'
+           '?per_page=100' % REPO_SLUG)
+    out = {}
+    while url:
+        req = urllib.request.Request(url, headers=H)
+        r = urllib.request.urlopen(req, timeout=30)
+        for x in json.loads(r.read().decode()):
+            out[x['ref']] = x['object']['sha']
+        m = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get('Link', ''))
+        url = m.group(1) if m else None
+    return out
+
+
+def fetch_missing(chunk=5):
     """拉「远端新增」或「同名分支 sha 变了」的 cutoff 分支。
 
-    返回 (需更新数, 远端总数)；新增数为负表示 ls-remote / fetch 失败。
+    返回 (需更新数, 远端总数)；新增数为负表示 API / fetch 失败。
     绝不能用 '+refs/heads/cutoff-*:...' 通配符 refspec —— 那是 100s+ 的根源。
 
     关键：workflow 用 git push -f 覆盖同名结果分支，重跑低覆盖组合时
     分支名不变、sha 会变。只按名字求差会漏掉全部重跑成果（曾导致
     run #5/#6 的数据滞留在云端、达标数卡住不涨）。
     """
-    p = None
-    for _ in range(3):                    # ls-remote 偶发 60s 超时，重试
-        p = git('ls-remote', '--heads', REMOTE, 'refs/heads/cutoff-*',
-                text=True, timeout=90)
-        if p.returncode == 0:
-            break
-    if p is None or p.returncode != 0:
+    try:
+        remote = remote_shas()
+    except Exception as e:
+        print('  [远端 sha] API 失败: %s %s' % (type(e).__name__, e), flush=True)
         return -1, 0
-    remote = {}
-    for l in p.stdout.splitlines():
-        if '\t' in l and 'refs/heads/cutoff-' in l:
-            sha, ref = l.split('\t')
-            remote[ref.strip()] = sha.strip()
     have = git('for-each-ref', '--format=%(refname) %(objectname)', REFS, text=True)
     local = {}
     for l in have.stdout.splitlines():
@@ -121,13 +136,27 @@ def fetch_missing(chunk=50):
     miss = [r for r, s in remote.items() if local.get(r) != s]
     if not miss:
         return 0, len(remote)
+    # 逐批独立容错：某批跨境超时只丢该批，不放弃其余分支；
+    # 下一轮 sha 差集会自动补齐失败的批。
+    got, fail_batches = 0, 0
     for i in range(0, len(miss), chunk):
+        part = miss[i:i + chunk]
         rs = ['+%s:refs/remotes/gh/%s' % (r, r.split('refs/heads/')[-1])
-              for r in miss[i:i + chunk]]
-        q = git('fetch', '-q', REMOTE, *rs, timeout=120)
-        if q.returncode != 0:
-            return -2, len(remote)
-    return len(miss), len(remote)
+              for r in part]
+        try:
+            q = git('fetch', '-q', REMOTE, *rs, timeout=120)
+            ok_batch = (q.returncode == 0)
+        except subprocess.TimeoutExpired:
+            ok_batch = False       # 单批超时不拖垮整轮，下轮 sha 差集自动补齐
+        if ok_batch:
+            got += len(part)
+        else:
+            fail_batches += 1
+            print('  [增量 fetch] 第 %d 批(%d 个)失败，跳过待下轮补齐' %
+                  (i // chunk + 1, len(part)), flush=True)
+    print('  [增量 fetch] 成功 %d / 需更新 %d，失败批次 %d' %
+          (got, len(miss), fail_batches), flush=True)
+    return got, len(remote)
 
 
 def main():
