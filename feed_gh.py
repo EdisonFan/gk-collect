@@ -46,10 +46,12 @@ def save_log(d):
     os.replace(tmp, LOG)
 
 
-def dispatch(combos, tag=''):
-    body = json.dumps({'ref': 'main',
-                       'inputs': {'combos': json.dumps(combos, ensure_ascii=False),
-                                  'tag': tag or ('batch-%s' % time.strftime('%H%M%S'))}},
+def dispatch(combos, tag='', relay=None):
+    inputs = {'combos': json.dumps(combos, ensure_ascii=False),
+              'tag': tag or ('batch-%s' % time.strftime('%H%M%S'))}
+    if relay is not None:
+        inputs['relay'] = relay
+    body = json.dumps({'ref': 'main', 'inputs': inputs},
                       ensure_ascii=False).encode('utf-8')
     tok = token()
     for gap in [0] + list(RETRY_GAPS):
@@ -97,6 +99,8 @@ def main():
     ap.add_argument('--limit', type=int, default=40)
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--force', action='store_true', help='忽略台账，强制重派')
+    ap.add_argument('--relay', choices=['on', 'off'],
+                    help='是否启用云端自接力（单组合验证可设 off）')
     a = ap.parse_args()
     if a.status:
         status(); return
@@ -118,7 +122,7 @@ def main():
 
     print('派发 %d 个组合: %s ...' % (len(combos), ' '.join(combos[:5])), flush=True)
     tag = 'gh-%s' % time.strftime('%m%d-%H%M%S')
-    if not dispatch(combos, tag):
+    if not dispatch(combos, tag, a.relay):
         raise SystemExit('派发失败，组合保留在待派清单')
     now = time.time()
     for c in combos:
