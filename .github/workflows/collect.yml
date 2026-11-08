@@ -1,0 +1,82 @@
+name: gk-cutoff
+run-name: "采集投档线 ${{ inputs.tag }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      combos:
+        description: 'JSON array of "prov-year"'
+        required: true
+        type: string
+        default: '[]'
+      tag:
+        description: '批次标签，便于日志识别'
+        required: false
+        type: string
+        default: 'manual'
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        combo: ${{ fromJSON(inputs.combos) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 采集
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          export PROV YEAR
+          echo "=== $PROV-$YEAR ==="
+          mkdir -p out
+          BR="cutoff-${PROV}-${YEAR}"
+          if git fetch -q --depth=1 origin "refs/heads/${BR}" 2>/dev/null; then
+            git show "FETCH_HEAD:out/cutoff_${PROV}_${YEAR}.json" > out/prev.json 2>/dev/null || rm -f out/prev.json
+            echo "已读取上轮 $BR 结果作为增量基础"
+          fi
+          python3 collect_cutoff.py
+          rm -f out/prev.json
+
+      - name: 推送结果分支
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          BR="cutoff-${PROV}-${YEAR}"
+          F="out/cutoff_${PROV}_${YEAR}.json"
+          if [ ! -s "$F" ]; then echo "无结果文件，跳过推送"; exit 0; fi
+          git config user.email "gk-collect@users.noreply.github.com"
+          git config user.name "gk-collect"
+          git checkout -B "$BR"
+          git add -f "$F"
+          git commit -m "cutoff ${PROV}-${YEAR}" || echo "无变更"
+          git push -f origin "HEAD:refs/heads/${BR}"
+          echo "已推送 $BR"
+
+      - name: 上传结果制品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutoff-${{ matrix.combo }}
+          path: out/cutoff_*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true
