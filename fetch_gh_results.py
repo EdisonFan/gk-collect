@@ -167,9 +167,12 @@ def main():
         nrefs2, r2, t2, s2, f2 = nrefs, 0, 0, 0, f1
         print('[本地读取] 无新增分支，跳过二次读取', flush=True)
 
+    # 两遍 scan 都是全量读取，r1+r2 / t1+t2 相加会把总量显示成双倍
+    n_final, files_written, records_total = (
+        (nrefs2, r2, t2) if added > 0 else (nrefs, r1, t1))
     print('-' * 78)
-    print('合计本地引用 %d 个 / 本轮写入 %d 文件 / %d 条记录 / 失败 %d' %
-          (nrefs2, r1 + r2, t1 + t2, len(f2)), flush=True)
+    print('合计本地引用 %d 个 / 本轮落盘 %d 文件 / 当前总量 %d 条记录 / 读取失败 %d' %
+          (n_final, files_written, records_total, len(f2)), flush=True)
     if f2:
         print('读取失败(可能分支刚推送): %s' % ' '.join(f2[:10]), flush=True)
     print('落盘目录: %s' % DEST, flush=True)

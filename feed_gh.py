@@ -49,8 +49,10 @@ def save_log(d):
 def dispatch(combos, tag='', relay=None):
     inputs = {'combos': json.dumps(combos, ensure_ascii=False),
               'tag': tag or ('batch-%s' % time.strftime('%H%M%S'))}
-    if relay is not None:
-        inputs['relay'] = relay
+    # 必须显式传 relay：workflow_dispatch 未带该 input 时，job 级
+    # if: inputs.relay == 'on' 取到空值，relay job 根本不会创建（实测 #14
+    # 167 个 job 全是 collect，自接力链条断了）。显式传值才能稳定生效。
+    inputs['relay'] = relay or 'on'
     body = json.dumps({'ref': 'main', 'inputs': inputs},
                       ensure_ascii=False).encode('utf-8')
     tok = token()
