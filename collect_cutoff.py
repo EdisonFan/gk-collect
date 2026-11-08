@@ -86,11 +86,14 @@ def call(proxy, page, extra):
         return json.loads(r.read().decode('utf-8'))
 
 
-def query_strict(page, extra, proxies, stats, lock, seed=0):
-    """严格查询：轮换代理直到拿到合法响应，绝不静默吞掉失败。
+def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
+    """严格查询：轮换代理直到拿到合法且完整的响应，绝不静默吞掉失败。
 
     返回 (items, numFound|None, ok)。numFound=0 是合法成功（空片），
     与 ok=False（探测失败）严格区分——v4 把两者都 continue 掉，正是丢数据源头。
+
+    min_items>0 时做页级完整性校验：返回的记录数不足即视为失败并换代理，
+    防止「code=0000 但 item 残缺/为空」的页混进 G4 造成隐性丢数据。
     """
     tag = (sum(ord(c) for c in json.dumps(extra, sort_keys=True, ensure_ascii=False))
            + page * 7 + seed)
@@ -101,9 +104,14 @@ def query_strict(page, extra, proxies, stats, lock, seed=0):
             d = call(px, page, extra)
             code, dat = str(d.get('code')), d.get('data')
             if code == '0000' and isinstance(dat, dict):
+                it = dat.get('item') or []
+                if len(it) < min_items:
+                    with lock:
+                        stats['short_page'] += 1
+                    continue              # 页残缺，换下一个代理重来
                 with lock:
                     stats['ok'] += 1
-                return (dat.get('item') or []), dat.get('numFound'), True
+                return it, dat.get('numFound'), True
             with lock:
                 stats['throttled' if code in ('1069', '1074') else 'other'] += 1
             if code == '1069':
@@ -114,9 +122,11 @@ def query_strict(page, extra, proxies, stats, lock, seed=0):
     try:                                  # 代理全挂，直连兜底
         d = call(None, page, extra)
         if str(d.get('code')) == '0000' and isinstance(d.get('data'), dict):
-            with lock:
-                stats['direct'] += 1
-            return (d['data'].get('item') or []), d['data'].get('numFound'), True
+            it = d['data'].get('item') or []
+            if len(it) >= min_items:
+                with lock:
+                    stats['direct'] += 1
+                return it, d['data'].get('numFound'), True
     except Exception:
         pass
     with lock:
@@ -236,27 +246,33 @@ def dedupe(items):
 
 
 def collect_pages(leaves, proxies, stats, lock, t0):
-    """页任务全采，失败页换代理补采到 0。返回 (res, failed)。"""
+    """页任务全采，失败页换代理补采到 0。返回 (res, failed)。
+
+    每个页任务带 expected：非末页须满 SIZE 条，末页须为该片余数条；
+    不足即由 query_strict 换代理重试，保证 G4 的原始条数守恒可达成。
+    """
     jobs = []
     for extra, n, pages, label in leaves:
         for p in range(1, pages + 1):
-            jobs.append((p, extra, label))
+            exp = SIZE if p < pages else n - (pages - 1) * SIZE
+            jobs.append((p, extra, label, exp))
     total = len(jobs)
     res, failed = {}, list(jobs)
     for rnd in range(1, MAX_PAGE_ROUNDS + 1):
         if not failed:
             break
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = {ex.submit(query_strict, p, e, proxies, stats, lock, rnd * 977): (p, e, l)
-                    for p, e, l in failed}
+            futs = {ex.submit(query_strict, p, e, proxies, stats, lock,
+                              rnd * 977, exp): (p, e, l, exp)
+                    for p, e, l, exp in failed}
             new_failed = []
             for f in as_completed(futs):
-                p, e, l = futs[f]
+                p, e, l, exp = futs[f]
                 items, nf, ok = f.result()
                 if ok:
                     res[(l, p)] = items
                 else:
-                    new_failed.append((p, e, l))
+                    new_failed.append((p, e, l, exp))
         failed = new_failed
         print('  [页 轮%d] 成功 %d/%d，仍失败 %d | %.0fs' %
               (rnd, len(res), total, len(failed), time.time() - t0), flush=True)
@@ -271,7 +287,7 @@ def main():
         proxies = [None]
     lock = threading.Lock()
     stats = {'ok': 0, 'throttled': 0, 'other': 0, 'conn_err': 0,
-             'direct': 0, 'query_failed': 0}
+             'direct': 0, 'query_failed': 0, 'short_page': 0}
     t0 = time.time()
     os.makedirs('out', exist_ok=True)
     print('=== v5 零丢失采集 PROV=%s YEAR=%s 代理=%d 并发=%d ===' %
@@ -331,26 +347,38 @@ def main():
         res, failed = collect_pages(leaves, proxies, stats, lock, t0)
     print('  [G3] 页成功 %d / 失败 %d' % (len(res), len(failed)), flush=True)
 
-    # ---- G4：条数守恒 ----
-    # 关键：G4 必须由「完备切分的页任务」独立判定，不能让 BASE 样本页
-    # 把失败页的记录补上从而误判通过（样本只是递归切分兜底用的探测副产品）。
-    part_items = [it for v in res.values() for it in v]
-    part_uniq = dedupe(part_items)
-    # 落盘集合仍最大化保留已采数据（prev + 样本 + 页任务），一条不丢
-    uniq = dedupe(prev_items + sample_items + part_items)
-    count_ok = bool(base_ok and len(uniq) == base_nf
-                    and len(part_uniq) == base_nf)
+    # ---- G4：条数守恒（按接口原始返回条数，而非去重数）----
+    # 实测修正：接口 numFound 统计的是「原始记录条数」，其中可能含内容
+    # 完全相同的重复记录（65-2026 实测 18 条）。v5 初版按整条内容 md5
+    # 去重后只有 7048/7066 被 G4 判死，但那 18 条并未丢失，只是接口数据
+    # 本身重复。零丢失的正确判据是「接口返回的每一条都采到」：
+    #   part_count（完备切分页任务的原始记录总数）== numFound
+    # 跨页抖动造成的重复会让 part_count > numFound，同样判失败并重派；
+    # 某页返回空却算成功，part_count < numFound，也会被这里拦住。
+    # BASE 样本页不参与 G4，避免把失败页记录补上造成误判。
+    part_items = []
+    for key in sorted(res.keys()):
+        part_items += res[key]
+    part_count = len(part_items)
+    part_uniq_count = len(dedupe(part_items))
 
     gate = {
         'G1_base': base_ok,
         'G2_partition': part_ok,
         'G3_pages_zero_fail': bool(part_ok and len(failed) == 0),
-        'G4_count_match': count_ok,
+        'G4_count_match': bool(base_ok and part_ok and part_count == base_nf),
     }
     gate_pass = all(gate.values())
-    print('  [G4] count=%d partition_count=%d numFound=%d ok=%s' %
-          (len(uniq), len(part_uniq), base_nf, count_ok), flush=True)
+    print('  [G4] raw=%d uniq=%d numFound=%d ok=%s' %
+          (part_count, part_uniq_count, base_nf, gate['G4_count_match']), flush=True)
     print('  === 闸门 %s gate_pass=%s ===' % (gate, gate_pass), flush=True)
+
+    # 达标 -> 落盘原始全量（一条不少，含接口内重复，count 严格等于 numFound）
+    # 未达标 -> 增量暂存，最大化保留已采数据供下轮续采
+    if gate_pass:
+        out_items = part_items
+    else:
+        out_items = dedupe(prev_items + sample_items + part_items)
 
     path = 'out/cutoff_%s_%s.json' % (PROV, YEAR)
     if not base_ok:
@@ -363,9 +391,10 @@ def main():
 
     out = {
         'version': 'v5', 'prov': PROV, 'year': YEAR, 'api': API,
-        'num_found': base_nf, 'count': len(uniq),
-        'partition_count': len(part_uniq),
-        'coverage_pct': round(100.0 * len(uniq) / base_nf, 1) if base_nf else 0,
+        'num_found': base_nf, 'count': len(out_items),
+        'partition_count': part_count,          # 页任务原始条数，G4 判据
+        'dup_in_api': part_count - part_uniq_count,   # 接口数据内含重复条数，供审计
+        'coverage_pct': round(100.0 * len(out_items) / base_nf, 1) if base_nf else 0,
         'gate_pass': gate_pass, 'gate': gate,
         'partition': audit,
         'pages_total': audit.get('pages', 0), 'pages_ok': len(res),
@@ -376,14 +405,16 @@ def main():
         'elapsed': round(time.time() - t0, 1), 'stats': stats,
         'collected_at': time.strftime('%F %T'),
         'build_id': os.environ.get('GITHUB_RUN_ID', os.environ.get('CNB_BUILD_ID', '')),
-        'items': uniq,
+        'items': out_items,
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False)
-    print('=== 完成: %d/%d 条 / gate_pass=%s / %.0fs -> %s ===' %
-          (len(uniq), base_nf, gate_pass, time.time() - t0, path), flush=True)
+    print('=== 完成: %d/%d 条 / gate_pass=%s / 接口内重复 %d / %.0fs -> %s ===' %
+          (len(out_items), base_nf, gate_pass, out['dup_in_api'],
+           time.time() - t0, path), flush=True)
     print('RESULT_JSON ' + json.dumps(
-        {'prov': PROV, 'year': YEAR, 'count': len(uniq), 'num_found': base_nf,
+        {'prov': PROV, 'year': YEAR, 'count': len(out_items), 'num_found': base_nf,
+         'partition_count': part_count, 'dup_in_api': out['dup_in_api'],
          'gate_pass': gate_pass, 'gate': gate, 'pages_failed': len(failed)},
         ensure_ascii=False), flush=True)
 
