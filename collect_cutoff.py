@@ -1,27 +1,33 @@
 # -*- coding: utf-8 -*-
-"""CNB 流水线生产采集器 v4：院校投档线 score/province（补齐版）。
+"""投档线采集器 v5（零丢失版）：gk/score/province。
 
-与本地 collect_proxy.py 完全错开，互不抢数据、互不抢代理：
-  本地  = 按 2970 校遍历 plan/school、score/special
-  CNB   = 按 省×年 拉 score/province 全量院校投档线（对应 T08 admission_cutoff）
+与 v4 的根本区别：
+  v4 = 靠样本猜科类/批次做启发式三级切分 + 探测失败片静默跳过
+       （if not ok2 or not n: continue）+ 覆盖率 >=95% 就落盘算达标
+       -> 会丢数据，且把不完整结果标成"完成"
+  v5 = province_id 34 省确定性完备切分 + 四道闸门，任一不过不算完成
 
-接口实测约束：
-  - size 只能 20；单维度查询硬翻页上限 200 页 / 4000 条，201 页起返回空
-  - 可用筛选参数：local_type_name(科类)、local_batch_name(批次)、province_id(院校所在省)
-  - 其余参数(nature_name/level_name/sg_type/sort 等)被接口忽略
+零丢失定义（单个 PROV-YEAR）：
+  numFound = 无筛选查询给出的应采总条数
+  count    = 去重后实际落盘条数
+  必须 count == numFound，且中间每一步可审计、可复算。
 
-v4 相对 v3 的修正：
-  1. 三级拆分：(type) → (type,batch) → (type,batch,province_id)，
-     解决 v3 里「物理类/本科批 4249 条」超上限被整块跳过的问题。
-  2. 失败页补采：页任务跑完后对失败页再跑 2 轮（换代理起点），
-     解决 v3 里 43~99 页因代理连接失败/限流丢失的问题。
-  3. 合并上轮结果：读 out/prev.json（.cnb.yml 从上轮分支 fetch 得到），
-     两轮数据按记录内容哈希去重，覆盖率叠加。
-  4. probe 并发化，避免 34 个 province_id 串行探测拖慢。
+四道闸门：
+  G1 base      无筛选首页成功取到 numFound（重试 PROBE_ROUNDS 轮）
+  G2 partition 34 省探测零失败 且 Σ 省 numFound == BASE numFound；
+               >4000 条的片递归按科类/批次切分，每层同样验证 Σ 守恒
+  G3 pages     所有页任务成功，失败页换代理补采到 0（MAX_PAGE_ROUNDS 轮）
+  G4 count     去重后 count == numFound
 
-环境变量：PROV(13/41/44/37) YEAR(2021..2026)
-输出：out/cutoff_{PROV}_{YEAR}.json，由 .cnb.yml 强制覆盖 push 到独立分支。
-仅用 Python 标准库；代理来自仓库内 proxies_cnb.txt（CNB 专属，与本地池零交集）。
+gate_pass = G1 && G2 && G3 && G4。
+闸门未全过仍写结果文件并推分支（保留增量，绝不丢已采数据），但
+collect.yml 会把该 job 标为失败，巡航据此重派；只有 gate_pass=true 才算达标。
+G1 失败（连 BASE 都没取到）时不写结果文件，避免用空壳覆盖云端旧结果。
+
+实测依据：province_id 是接口真实生效的筛选参数，34 个值构成确定性
+完备划分，不依赖样本猜科类/批次。65-2026 7066 / 62-2025 7140 /
+62-2024 6534 / 65-2025 7867 / 13-2026 5778 / 44-2025 8495 /
+11-2021 1442 的 34 省 Σ 精确等于 BASE numFound，且无片 >4000 条。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,18 +45,22 @@ PROV = os.environ.get('PROV', '13')
 YEAR = int(os.environ.get('YEAR', '2026'))
 SIZE = 20
 PAGE_CAP = 200
-ITEM_CAP = PAGE_CAP * SIZE
+ITEM_CAP = PAGE_CAP * SIZE          # 4000：单维度硬翻页上限
 TIMEOUT = 3
-MAX_RETRY = 4
 WORKERS = 8
+QUERY_ROUNDS = 10                  # 单次查询最多轮换 10 个代理
+PROBE_ROUNDS = 8                   # 探测整体重试轮次
+MAX_PAGE_ROUNDS = 15               # 页补采轮次
 API = 'apidata/api/gk/score/province'
-CANDIDATE_TYPES = ['物理类', '历史类', '文科', '理科', '综合', '理工', '文史',
-                   '不分文理', '艺术类', '体育类', '物理科目组合', '历史科目组合']
+
+# 34 个院校所在省级行政区代码，构成确定性完备划分
 PROVINCE_IDS = ['11', '12', '13', '14', '15', '21', '22', '23', '31', '32',
                 '33', '34', '35', '36', '37', '41', '42', '43', '44', '45',
                 '46', '50', '51', '52', '53', '54', '61', '62', '63', '64',
                 '65', '71', '81', '82']
-# 批次候选兜底：样本前 30 页常常只覆盖「本科批」，不补齐会漏掉同科类的专科/提前批
+# 仅当某省片 >4000 条时才启用，作为二级切分兜底
+CANDIDATE_TYPES = ['物理类', '历史类', '文科', '理科', '综合', '理工', '文史',
+                   '不分文理', '艺术类', '体育类', '物理科目组合', '历史科目组合']
 CANDIDATE_BATCHES = [
     '本科批', '专科批', '本科提前批', '专科提前批',
     '本科批A段', '本科批B段', '本科批C段', '专科批A段', '专科批B段', '专科批C段',
@@ -67,7 +77,7 @@ def opener(proxy):
     return urllib.request.build_opener(ph)
 
 
-def fetch(proxy, page, extra):
+def call(proxy, page, extra):
     q = {'uri': API, 'local_province_id': PROV, 'year': YEAR,
          'page': page, 'size': SIZE}
     q.update(extra)
@@ -76,232 +86,305 @@ def fetch(proxy, page, extra):
         return json.loads(r.read().decode('utf-8'))
 
 
-def fetch_page(job, proxies, seed, stats, lock):
-    """job = (page, extra, label)。返回 (page, label, items, numFound, ok)。"""
-    page, extra, label = job
-    tag = sum(ord(c) for c in label)
+def query_strict(page, extra, proxies, stats, lock, seed=0):
+    """严格查询：轮换代理直到拿到合法响应，绝不静默吞掉失败。
+
+    返回 (items, numFound|None, ok)。numFound=0 是合法成功（空片），
+    与 ok=False（探测失败）严格区分——v4 把两者都 continue 掉，正是丢数据源头。
+    """
+    tag = (sum(ord(c) for c in json.dumps(extra, sort_keys=True, ensure_ascii=False))
+           + page * 7 + seed)
     n = len(proxies)
-    start = (page * 7 + seed + tag) % n
-    for k in range(MAX_RETRY):
-        px = proxies[(start + k) % n]
+    for k in range(QUERY_ROUNDS):
+        px = proxies[(tag + k) % n]
         try:
-            d = fetch(px, page, extra)
-            code = str(d.get('code'))
-            dat = d.get('data')
+            d = call(px, page, extra)
+            code, dat = str(d.get('code')), d.get('data')
             if code == '0000' and isinstance(dat, dict):
                 with lock:
                     stats['ok'] += 1
-                return page, label, (dat.get('item') or []), dat.get('numFound'), True
+                return (dat.get('item') or []), dat.get('numFound'), True
             with lock:
-                if code in ('1069', '1074') or (code == '0000' and not isinstance(dat, dict)):
-                    stats['throttled'] += 1
-                else:
-                    stats['other'] += 1
+                stats['throttled' if code in ('1069', '1074') else 'other'] += 1
             if code == '1069':
-                time.sleep(0.3)
+                time.sleep(0.25)
         except Exception:
             with lock:
                 stats['conn_err'] += 1
-    try:
-        d = fetch(None, page, extra)
+    try:                                  # 代理全挂，直连兜底
+        d = call(None, page, extra)
         if str(d.get('code')) == '0000' and isinstance(d.get('data'), dict):
             with lock:
                 stats['direct'] += 1
-            return page, label, (d['data'].get('item') or []), d['data'].get('numFound'), True
+            return (d['data'].get('item') or []), d['data'].get('numFound'), True
     except Exception:
         pass
     with lock:
-        stats['failed_pages'] += 1
-    return page, label, [], None, False
+        stats['query_failed'] += 1
+    return [], None, False
 
 
-def run_jobs(jobs, proxies, seed, stats, lock, t0, phase):
-    """并发跑页任务，返回 ({(label,page): items}, failed_jobs)。"""
-    out, failed = {}, []
-    total = len(jobs)
-    if not total:
-        return out, failed
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(fetch_page, j, proxies, seed, stats, lock): j for j in jobs}
-        done = 0
-        for f in as_completed(futs):
-            p, label, batch, _, ok = f.result()
-            if ok:
-                out[(label, p)] = batch
-            else:
-                failed.append(futs[f])
-            done += 1
-            if done % 40 == 0 or done == total:
-                cnt = sum(len(v) for v in out.values())
-                print('  [%s] %d/%d 页 累计 %d 条 | ok=%d err=%d thr=%d 直连=%d 失败=%d | %.0fs' %
-                      (phase, done, total, cnt, stats['ok'], stats['conn_err'],
-                       stats['throttled'], stats['direct'], stats['failed_pages'],
-                       time.time() - t0), flush=True)
-    return out, failed
+def probe_strict_all(specs, proxies, stats, lock, phase, t0):
+    """并发严格探测：所有 spec 必须成功；未成功的换 seed 重试。
 
-
-def probe(extra, label, proxies, seed, stats, lock):
-    _, _, items, nf, ok = fetch_page((1, extra, label), proxies, seed, stats, lock)
-    return (int(nf) if nf else 0), items, ok
-
-
-def probe_all(specs, proxies, seed, stats, lock):
-    """specs: [(extra,label)]，并发探测，返回 [(extra,label,n,items,ok)]。"""
+    specs: [(extra, label)]，label 必须唯一。
+    返回 [(extra, label, n, items, ok)]，顺序与 specs 一致；
+    探测失败的片明确 ok=False（不再静默跳过），交由 G2 判死。
+    """
+    done = {}
+    pending = list(specs)
+    for rnd in range(PROBE_ROUNDS):
+        if not pending:
+            break
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = {ex.submit(query_strict, 1, e, proxies, stats, lock, rnd * 131): (e, l)
+                    for e, l in pending}
+            for f in as_completed(futs):
+                e, l = futs[f]
+                items, nf, ok = f.result()
+                if ok and nf is not None:
+                    done[l] = (e, l, int(nf), items, True)
+        pending = [(e, l) for e, l in pending if l not in done]
+        print('  [探测 %s 轮%d] 成功 %d/%d | %.0fs' %
+              (phase, rnd + 1, len(done), len(specs), time.time() - t0), flush=True)
     res = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(probe, e, l, proxies, seed, stats, lock): (e, l) for e, l in specs}
-        for f in as_completed(futs):
-            e, l = futs[f]
-            n, items, ok = f.result()
-            res.append((e, l, n, items, ok))
+    for e, l in specs:
+        res.append(done[l] if l in done else (e, l, 0, [], False))
     return res
+
+
+def split_oversize(extra, label, parent_n, sample_items,
+                   proxies, stats, lock, t0, audit):
+    """>4000 条的省片：先按科类切、仍超限再按批次切。
+
+    每层都验证「Σ 子片 numFound == 父片 numFound」且探测零失败；
+    任何一层不守恒即返回 False，绝不凑合。
+    """
+    def one_level(e0, l0, pn, dim, candidates):
+        vals = {it.get(dim) for it in sample_items if it.get(dim)} | set(candidates)
+        specs = [(dict(e0, **{dim: v}), '%s|%s=%s' % (l0, dim, v))
+                 for v in sorted(vals)]
+        res = probe_strict_all(specs, proxies, stats, lock, l0 + '/' + dim, t0)
+        audit.setdefault('splits', []).append({
+            'parent': l0, 'dim': dim, 'parent_n': pn,
+            'sum': sum(x[2] for x in res),
+            'failed': [x[1] for x in res if not x[4]],
+        })
+        if any(not x[4] for x in res) or sum(x[2] for x in res) != pn:
+            return None
+        return [(e2, l2, n) for e2, l2, n, it2, ok in res if n > 0]
+
+    lv1 = one_level(extra, label, parent_n, 'local_type_name', CANDIDATE_TYPES)
+    if lv1 is None:
+        return [], False
+    leaves = []
+    for e2, l2, n in lv1:
+        if n <= ITEM_CAP:
+            leaves.append((e2, n, (n + SIZE - 1) // SIZE, l2))
+        else:
+            lv2 = one_level(e2, l2, n, 'local_batch_name', CANDIDATE_BATCHES)
+            if lv2 is None:
+                return [], False
+            for e3, l3, n3 in lv2:
+                if n3 > ITEM_CAP:
+                    return [], False      # 再超限 -> G2 失败，等待重派
+                leaves.append((e3, n3, (n3 + SIZE - 1) // SIZE, l3))
+    return leaves, True
+
+
+def build_partition(base_nf, sample_items, proxies, stats, lock, t0, audit):
+    """34 省确定性完备切分 + Σ 守恒校验。返回 (leaves, complete)。
+
+    leaves = [(extra, n, pages, label)]
+    """
+    specs = [({'province_id': pid}, 'p%s' % pid) for pid in PROVINCE_IDS]
+    res = probe_strict_all(specs, proxies, stats, lock, '省', t0)
+    audit['provinces'] = {x[1][1:]: x[2] for x in res}
+    audit['prov_failed'] = [x[1] for x in res if not x[4]]
+    audit['prov_sum'] = sum(x[2] for x in res)
+    audit['base'] = base_nf
+    if audit['prov_failed']:
+        return [], False
+    if audit['prov_sum'] != base_nf:
+        return [], False
+    leaves = []
+    for e, l, n, it, ok in res:
+        if n == 0:
+            continue                      # 合法空片，不产生页任务
+        if n <= ITEM_CAP:
+            leaves.append((e, n, (n + SIZE - 1) // SIZE, l))
+        else:
+            sub, ok2 = split_oversize(e, l, n, sample_items,
+                                      proxies, stats, lock, t0, audit)
+            if not ok2:
+                return [], False
+            leaves += sub
+    audit['leaves'] = len(leaves)
+    audit['pages'] = sum(x[2] for x in leaves)
+    return leaves, True
+
+
+def dedupe(items):
+    """按整条记录内容哈希去重，保持原顺序。"""
+    seen, out = set(), []
+    for it in items:
+        k = hashlib.md5(json.dumps(it, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        if k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+
+def collect_pages(leaves, proxies, stats, lock, t0):
+    """页任务全采，失败页换代理补采到 0。返回 (res, failed)。"""
+    jobs = []
+    for extra, n, pages, label in leaves:
+        for p in range(1, pages + 1):
+            jobs.append((p, extra, label))
+    total = len(jobs)
+    res, failed = {}, list(jobs)
+    for rnd in range(1, MAX_PAGE_ROUNDS + 1):
+        if not failed:
+            break
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = {ex.submit(query_strict, p, e, proxies, stats, lock, rnd * 977): (p, e, l)
+                    for p, e, l in failed}
+            new_failed = []
+            for f in as_completed(futs):
+                p, e, l = futs[f]
+                items, nf, ok = f.result()
+                if ok:
+                    res[(l, p)] = items
+                else:
+                    new_failed.append((p, e, l))
+        failed = new_failed
+        print('  [页 轮%d] 成功 %d/%d，仍失败 %d | %.0fs' %
+              (rnd, len(res), total, len(failed), time.time() - t0), flush=True)
+    return res, failed
 
 
 def main():
     proxies = [x.strip() for x in open('proxies_cnb.txt', encoding='utf-8') if x.strip()]
-    random.seed('cnb-%s-%s' % (PROV, YEAR))
+    random.seed('v5-%s-%s' % (PROV, YEAR))
     random.shuffle(proxies)
     if not proxies:
         proxies = [None]
-    seed = sum(ord(c) for c in '%s-%s' % (PROV, YEAR))
     lock = threading.Lock()
     stats = {'ok': 0, 'throttled': 0, 'other': 0, 'conn_err': 0,
-             'direct': 0, 'failed_pages': 0}
+             'direct': 0, 'query_failed': 0}
     t0 = time.time()
     os.makedirs('out', exist_ok=True)
-    print('=== CNB 投档线采集 v4 PROV=%s YEAR=%s 代理=%d 并发=%d 页上限=%d ===' %
-          (PROV, YEAR, len(proxies), WORKERS, PAGE_CAP), flush=True)
+    print('=== v5 零丢失采集 PROV=%s YEAR=%s 代理=%d 并发=%d ===' %
+          (PROV, YEAR, len(proxies), WORKERS), flush=True)
 
-    # ⓪ 上轮结果作为增量基础
+    # 上轮结果作为增量基础（闸门未过时重派，已采数据累积不丢）
     prev_items = []
     if os.path.exists('out/prev.json'):
         try:
             prev_items = json.load(open('out/prev.json', encoding='utf-8')).get('items', [])
         except Exception:
             pass
-    print('  上轮结果 %d 条作为增量基础' % len(prev_items), flush=True)
+    print('  上轮增量基础 %d 条' % len(prev_items), flush=True)
 
-    # ① 探测总量 + 采前 30 页样本用于发现科类/批次
-    num_found, sample, ok = 0, [], False
-    for attempt in range(4):          # 首屏偶发代理/直连全挂，重试几轮避免整片作废
-        num_found, sample, ok = probe({}, 'BASE%d' % attempt, proxies, seed, stats, lock)
-        if ok and num_found:
+    # ---- G1：BASE numFound ----
+    base_ok, base_nf, sample = False, 0, []
+    for rnd in range(PROBE_ROUNDS):
+        items, nf, ok = query_strict(1, {}, proxies, stats, lock, rnd * 31)
+        if ok and nf is not None:
+            base_ok, base_nf, sample = True, int(nf), list(items)
             break
-        time.sleep(1.5)
-    if not (ok and num_found):
-        raise SystemExit('第 1 页连续 4 轮取不到 numFound，放弃（避免产生空结果分支）')
-    print('  原始 numFound=%d（单维度最多返回 %d 条）' % (num_found, ITEM_CAP), flush=True)
-    sample_jobs = [(p, {}, 'BASE') for p in range(2, min(31, (num_found + SIZE - 1) // SIZE) + 1)]
-    sample_res, _ = run_jobs(sample_jobs, proxies, seed, stats, lock, t0, '样本')
-    base_items = sample + [it for v in sample_res.values() for it in v] + prev_items
+        time.sleep(1.0)
+    print('  [G1] BASE numFound=%d ok=%s' % (base_nf, base_ok), flush=True)
 
-    # ② 发现科类：样本实际值 + 候选并发探测
-    types = {it.get('local_type_name') for it in base_items if it.get('local_type_name')}
-    cand = [({'local_type_name': t}, 'P:' + t) for t in CANDIDATE_TYPES]
-    for e, l, n, _, ok2 in probe_all(cand, proxies, seed, stats, lock):
-        if ok2 and n > 0:
-            types.add(e['local_type_name'])
-    types = sorted(types)
-    print('  发现科类 %d 个: %s' % (len(types), types), flush=True)
+    # BASE 前 30 页样本：仅用于超限片递归切分时发现科类/批次实际值
+    sample_items = list(sample)
+    if base_ok:
+        last = min(31, (base_nf + SIZE - 1) // SIZE)
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = [ex.submit(query_strict, p, {}, proxies, stats, lock, 0)
+                    for p in range(2, last + 1)]
+            for f in as_completed(futs):
+                it, _, ok = f.result()
+                if ok:
+                    sample_items += it
+        print('  样本 %d 条（仅用于超限片递归切分兜底）' % len(sample_items), flush=True)
 
-    # ③ 构造子任务：type → (type,batch) → (type,batch,province_id)
-    jobs, incomplete, submeta = [], [], []
-    type_specs = [({'local_type_name': t}, 'S:' + t) for t in types]
-    type_res = probe_all(type_specs, proxies, seed, stats, lock)
-    need_batch = []
-    for e, l, n, _, ok2 in type_res:
-        t = e['local_type_name']
-        if not ok2 or not n:
-            continue
-        if n <= ITEM_CAP:
-            pages = min(PAGE_CAP, (n + SIZE - 1) // SIZE)
-            jobs += [(p, e, t) for p in range(1, pages + 1)]
-            submeta.append((t, n, pages))
-        else:
-            need_batch.append(t)
-    # 二级：按批次拆
-    if need_batch:
-        batch_specs = []
-        for t in need_batch:
-            bts = {it.get('local_batch_name') for it in base_items
-                   if it.get('local_type_name') == t and it.get('local_batch_name')}
-            bts |= set(CANDIDATE_BATCHES)   # 样本常只覆盖本科批，必须补齐候选
-            for bt in sorted(bts):
-                batch_specs.append(({'local_type_name': t, 'local_batch_name': bt},
-                                    'S:%s/%s' % (t, bt)))
-        need_prov = []
-        for e, l, n, _, ok2 in probe_all(batch_specs, proxies, seed, stats, lock):
-            if not ok2 or not n:
-                continue
-            if n <= ITEM_CAP:
-                pages = min(PAGE_CAP, (n + SIZE - 1) // SIZE)
-                jobs += [(p, e, e['local_type_name'] + '/' + e['local_batch_name'])
-                         for p in range(1, pages + 1)]
-                submeta.append((e['local_type_name'] + '/' + e['local_batch_name'], n, pages))
-            else:
-                need_prov.append(e)
-        # 三级：按院校所在省拆
-        if need_prov:
-            prov_specs = []
-            for e in need_prov:
-                for pid in PROVINCE_IDS:
-                    e2 = dict(e, province_id=pid)
-                    prov_specs.append((e2, 'S:%s/%s/p%s' %
-                                      (e['local_type_name'], e['local_batch_name'], pid)))
-            for e, l, n, _, ok2 in probe_all(prov_specs, proxies, seed, stats, lock):
-                if not ok2 or not n:
-                    continue
-                if n > ITEM_CAP:
-                    incomplete.append((e['local_type_name'], e['local_batch_name'],
-                                       e['province_id'], n))
-                    continue
-                pages = min(PAGE_CAP, (n + SIZE - 1) // SIZE)
-                jobs += [(p, e, l[2:]) for p in range(1, pages + 1)]
-                submeta.append((l[2:], n, pages))
-    print('  子任务 %d 个 / 页任务 %d 个 / 仍超限子集 %d 个' %
-          (len(submeta), len(jobs), len(incomplete)), flush=True)
+    # ---- G2：34 省完备切分 ----
+    audit = {}
+    leaves, part_ok = [], False
+    if base_ok:
+        leaves, part_ok = build_partition(base_nf, sample_items, proxies, stats,
+                                          lock, t0, audit)
+    print('  [G2] 完备切分 ok=%s 省Σ=%s BASE=%s 叶子=%s 页=%s' %
+          (part_ok, audit.get('prov_sum'), audit.get('base'),
+           audit.get('leaves'), audit.get('pages')), flush=True)
+    if audit.get('prov_failed'):
+        print('  [G2] 探测失败省: %s' % ' '.join(audit['prov_failed']), flush=True)
+    if part_ok is False and audit.get('prov_sum') is not None \
+            and audit.get('prov_sum') != audit.get('base'):
+        print('  [G2] Σ 不守恒，差 %s 条' %
+              (audit.get('base', 0) - audit.get('prov_sum', 0)), flush=True)
 
-    # ④ 全量采集 + 失败页补采 2 轮
-    res, failed = run_jobs(jobs, proxies, seed, stats, lock, t0, '全量')
-    for rnd in (1, 2):
-        if not failed:
-            break
-        print('  → 补采第 %d 轮：%d 页' % (rnd, len(failed)), flush=True)
-        retry = [(p, e, l + '#r%d' % rnd) for p, e, l in failed]
-        r2, f2 = run_jobs(retry, proxies, seed, stats, lock, t0, '补采%d' % rnd)
-        res.update(r2)
-        failed = f2
+    # ---- G3：页零失败 ----
+    res, failed = {}, []
+    if part_ok:
+        res, failed = collect_pages(leaves, proxies, stats, lock, t0)
+    print('  [G3] 页成功 %d / 失败 %d' % (len(res), len(failed)), flush=True)
 
-    # ⑤ 合并去重（上轮 + 本轮样本 + 本轮全量）
-    all_items = prev_items + base_items + [it for v in res.values() for it in v]
-    seen, uniq = set(), []
-    for it in all_items:
-        k = hashlib.md5(json.dumps(it, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-        if k not in seen:
-            seen.add(k)
-            uniq.append(it)
-    coverage = round(100.0 * len(uniq) / num_found, 1) if num_found else 0
+    # ---- G4：条数守恒 ----
+    # 关键：G4 必须由「完备切分的页任务」独立判定，不能让 BASE 样本页
+    # 把失败页的记录补上从而误判通过（样本只是递归切分兜底用的探测副产品）。
+    part_items = [it for v in res.values() for it in v]
+    part_uniq = dedupe(part_items)
+    # 落盘集合仍最大化保留已采数据（prev + 样本 + 页任务），一条不丢
+    uniq = dedupe(prev_items + sample_items + part_items)
+    count_ok = bool(base_ok and len(uniq) == base_nf
+                    and len(part_uniq) == base_nf)
+
+    gate = {
+        'G1_base': base_ok,
+        'G2_partition': part_ok,
+        'G3_pages_zero_fail': bool(part_ok and len(failed) == 0),
+        'G4_count_match': count_ok,
+    }
+    gate_pass = all(gate.values())
+    print('  [G4] count=%d partition_count=%d numFound=%d ok=%s' %
+          (len(uniq), len(part_uniq), base_nf, count_ok), flush=True)
+    print('  === 闸门 %s gate_pass=%s ===' % (gate, gate_pass), flush=True)
+
+    path = 'out/cutoff_%s_%s.json' % (PROV, YEAR)
+    if not base_ok:
+        # 连 BASE 都取不到：不写结果文件，避免空壳覆盖云端旧结果
+        print('  G1 失败，本轮不落盘（云端旧结果保持不变，等待重派）', flush=True)
+        print('RESULT_JSON ' + json.dumps(
+            {'prov': PROV, 'year': YEAR, 'gate_pass': False, 'gate': gate,
+             'num_found': 0, 'count': 0}, ensure_ascii=False), flush=True)
+        return
 
     out = {
-        'prov': PROV, 'year': YEAR, 'api': API,
-        'num_found': num_found, 'count': len(uniq), 'coverage_pct': coverage,
-        'prev_count': len(prev_items), 'pages_total': len(jobs), 'pages_ok': len(res),
-        'retry_failed': len(failed), 'subtasks': len(submeta), 'unresolved': incomplete,
-        'workers': WORKERS, 'timeout': TIMEOUT, 'page_cap': PAGE_CAP,
+        'version': 'v5', 'prov': PROV, 'year': YEAR, 'api': API,
+        'num_found': base_nf, 'count': len(uniq),
+        'partition_count': len(part_uniq),
+        'coverage_pct': round(100.0 * len(uniq) / base_nf, 1) if base_nf else 0,
+        'gate_pass': gate_pass, 'gate': gate,
+        'partition': audit,
+        'pages_total': audit.get('pages', 0), 'pages_ok': len(res),
+        'pages_failed': len(failed), 'prev_count': len(prev_items),
+        'workers': WORKERS, 'timeout': TIMEOUT, 'item_cap': ITEM_CAP,
+        'query_rounds': QUERY_ROUNDS, 'probe_rounds': PROBE_ROUNDS,
+        'page_rounds': MAX_PAGE_ROUNDS,
         'elapsed': round(time.time() - t0, 1), 'stats': stats,
         'collected_at': time.strftime('%F %T'),
-        'build_id': os.environ.get('CNB_BUILD_ID', ''),
-        'pipeline': os.environ.get('CNB_PIPELINE_NAME', ''),
+        'build_id': os.environ.get('GITHUB_RUN_ID', os.environ.get('CNB_BUILD_ID', '')),
         'items': uniq,
     }
-    path = 'out/cutoff_%s_%s.json' % (PROV, YEAR)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False)
-    print('=== 完成: %d 条 / numFound %d / 覆盖率 %.1f%% / 仍失败 %d 页 / %.0fs -> %s ===' %
-          (len(uniq), num_found, coverage, len(failed), time.time() - t0, path), flush=True)
+    print('=== 完成: %d/%d 条 / gate_pass=%s / %.0fs -> %s ===' %
+          (len(uniq), base_nf, gate_pass, time.time() - t0, path), flush=True)
     print('RESULT_JSON ' + json.dumps(
-        {'prov': PROV, 'year': YEAR, 'count': len(uniq), 'num_found': num_found,
-         'coverage_pct': coverage, 'retry_failed': len(failed)},
+        {'prov': PROV, 'year': YEAR, 'count': len(uniq), 'num_found': base_nf,
+         'gate_pass': gate_pass, 'gate': gate, 'pages_failed': len(failed)},
         ensure_ascii=False), flush=True)
 
 

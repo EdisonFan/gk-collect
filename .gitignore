@@ -2,3 +2,7 @@ out/
 __pycache__/
 *.log
 .secrets/
+gh_queue.json
+gh_todo.json
+巡航日志.md
+gh_output

@@ -14,9 +14,20 @@ on:
         required: false
         type: string
         default: 'manual'
+      relay_round:
+        description: '自接力轮次（0 起，达上限自动停止）'
+        required: false
+        type: string
+        default: '0'
+      relay:
+        description: '是否启用自接力（on/off）'
+        required: false
+        type: string
+        default: 'on'
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   collect:
@@ -32,7 +43,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 采集
+      - name: 采集（v5 零丢失）
         shell: bash
         env:
           COMBO: ${{ matrix.combo }}
@@ -49,9 +60,9 @@ jobs:
             echo "已读取上轮 $BR 结果作为增量基础"
           fi
           python3 collect_cutoff.py
-          rm -f out/prev.json
+          # prev.json 保留到下一步用于「已达标结果不降级」判定
 
-      - name: 推送结果分支
+      - name: 推送结果分支（闸门未过也保留增量）
         if: always()
         shell: bash
         env:
@@ -62,14 +73,30 @@ jobs:
           YEAR="${COMBO##*-}"
           BR="cutoff-${PROV}-${YEAR}"
           F="out/cutoff_${PROV}_${YEAR}.json"
-          if [ ! -s "$F" ]; then echo "无结果文件，跳过推送"; exit 0; fi
+          if [ ! -s "$F" ]; then
+            echo "无结果文件（G1 失败），跳过推送，云端旧结果不变"
+            rm -f out/prev.json
+            exit 0
+          fi
+          GP=$(python3 -c "import json;print(json.load(open('$F')).get('gate_pass', False))")
+          # 新结果闸门未过、而云端上轮已达标 -> 不推，避免 push -f 把已达标分支降级
+          OLD_GP="False"
+          if [ -s out/prev.json ]; then
+            OLD_GP=$(python3 -c "import json;print(json.load(open('out/prev.json')).get('gate_pass', False))" 2>/dev/null || echo False)
+          fi
+          if [ "$GP" = "False" ] && [ "$OLD_GP" = "True" ]; then
+            echo "新结果闸门未过，云端已有达标结果，跳过推送避免降级"
+            rm -f out/prev.json
+            exit 0
+          fi
           git config user.email "gk-collect@users.noreply.github.com"
           git config user.name "gk-collect"
           git checkout -B "$BR"
           git add -f "$F"
-          git commit -m "cutoff ${PROV}-${YEAR}" || echo "无变更"
+          git commit -m "cutoff ${PROV}-${YEAR} gate_pass=${GP}" || echo "无变更"
           git push -f origin "HEAD:refs/heads/${BR}"
-          echo "已推送 $BR"
+          echo "已推送 $BR (gate_pass=${GP})"
+          rm -f out/prev.json
 
       - name: 上传结果制品
         if: always()
@@ -80,3 +107,62 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
           overwrite: true
+
+      - name: 闸门校验（未全过则判失败，触发重派）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          F="out/cutoff_${COMBO%%-*}_${COMBO##*-}.json"
+          if [ ! -s "$F" ]; then
+            echo "::error::${COMBO} 无结果文件（G1 BASE 未取到），判失败待重派"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          prov, year = os.environ['COMBO'].split('-', 1)
+          d = json.load(open('out/cutoff_%s_%s.json' % (prov, year)))
+          print('闸门明细:', json.dumps(d.get('gate'), ensure_ascii=False))
+          print('numFound=%s count=%s partition_count=%s gate_pass=%s' %
+                (d.get('num_found'), d.get('count'), d.get('partition_count'),
+                 d.get('gate_pass')))
+          if not d.get('gate_pass'):
+              print('::error::%s-%s 闸门未全过，判失败待重派' % (prov, year))
+              sys.exit(1)
+          print('%s-%s 零丢失达标：count == numFound' % (prov, year))
+          PY
+
+  # 自接力：本轮结束后汇总未达标组合，自动触发下一轮（带轮次上限）
+  # 与平台每 5 分钟定时任务互补：relay 负责连续加速，定时任务负责链条断裂兜底
+  relay:
+    needs: collect
+    if: ${{ always() && inputs.relay == 'on' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 汇总未达标组合
+        id: judge
+        env:
+          COMBOS: ${{ inputs.combos }}
+          ROUND: ${{ inputs.relay_round }}
+        run: python3 relay_judge.py
+
+      - name: 触发下一轮（仅未达标组合）
+        if: steps.judge.outputs.todo != '[]' && steps.judge.outputs.todo != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TODO: ${{ steps.judge.outputs.todo }}
+          NEXT: ${{ steps.judge.outputs.next_round }}
+        run: |
+          echo "接力轮 $NEXT，未达标组合: $TODO"
+          gh workflow run collect.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f combos="$TODO" \
+            -f tag="relay-r${NEXT}" \
+            -f relay_round="$NEXT" \
+            -f relay=on
