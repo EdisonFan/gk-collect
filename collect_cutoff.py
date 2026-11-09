@@ -101,6 +101,10 @@ def opener(proxy):
 
 
 def call(proxy, page, extra):
+    # 硬性收口：job 跑在 GitHub runner 上，proxy=None 就会用 GitHub 共享出口
+    # IP 直连目标站；被限流后会影响后续所有采集任务。任何路径都不允许直连。
+    if not proxy:
+        raise RuntimeError('拒绝直连：代理为空（禁止使用 runner 出口 IP）')
     q = {'uri': API, 'local_province_id': PROV, 'year': YEAR,
          'page': page, 'size': SIZE}
     q.update(extra)
@@ -166,16 +170,9 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
                     CONN_FAILS[px] = CONN_FAILS.get(px, 0) + 1
                     if CONN_FAILS[px] >= DEAD_THRESHOLD:
                         DEAD_PROXIES.add(px)
-    try:                                  # 代理全挂，直连兜底
-        d = call(None, page, extra)
-        if str(d.get('code')) == '0000' and isinstance(d.get('data'), dict):
-            it = d['data'].get('item') or []
-            if len(it) >= min_items:
-                with lock:
-                    stats['direct'] += 1
-                return it, d['data'].get('numFound'), True
-    except Exception:
-        pass
+    # 代理耗尽即判失败，绝不直连兜底（理由见 call()）。
+    # 上一版此处有 call(None, ...) 兜底，会在整池老化时用 GitHub runner
+    # 出口 IP 打目标站，再被 relay/巡航反复重派放大，已移除。
     with lock:
         stats['query_failed'] += 1
     return [], None, False
@@ -361,10 +358,13 @@ def main():
     random.seed('v5-%s-%s' % (PROV, YEAR))
     random.shuffle(proxies)
     if not proxies:
-        proxies = [None]
+        # 空池不降级为直连，直接失败，避免整轮任务用 runner 出口 IP 采集
+        print('::error::proxies_cnb.txt 为空，拒绝直连，任务终止', flush=True)
+        raise SystemExit(1)
     lock = threading.Lock()
     stats = {'ok': 0, 'throttled': 0, 'other': 0, 'conn_err': 0,
-             'direct': 0, 'query_failed': 0, 'short_page': 0}
+             'direct': 0,  # 恒为 0：直连已禁用，保留键以兼容结果文件结构
+             'query_failed': 0, 'short_page': 0}
     t0 = time.time()
     os.makedirs('out', exist_ok=True)
     print('=== v5 零丢失采集 PROV=%s YEAR=%s 代理=%d 并发=%d ===' %
