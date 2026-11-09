@@ -1,0 +1,53 @@
+# GitHub Actions runner 上的代理池维护：每 2 小时探活 + 剔除失效 + 补充换血。
+#
+# 为什么不在平行世界定时任务里做（重要）：
+#   sandbox_agent 容器无法连通任意免费代理 IP，14:14 建任务以来每轮探活
+#   100% 硬超时、从未写回过池子。runner 网络能通（采集 job 已在用代理）。
+#
+# 为什么单独写 pool_keeper_run.py 而不复用共享层脚本（重要）：
+#   共享层 proxy_refresh.build_variants() 用「直连目标站」做基线，搬到 runner
+#   就等于用 GitHub 共享出口 IP 打 api.zjzw.cn，正是要避免的事。本工作流
+#   全程只经代理访问目标站，脚本内 _probe 对空 proxy 有硬性断言。
+#
+# 配额：单轮约 2~3 分钟，每 2 小时 = 12 轮/天，约 900~1100 分钟/月
+#       （私有仓免费额度 2000 分钟/月）。池无变化时不写回、也不触发镜像。
+
+name: Pool keeper (proxy refresh on runner)
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'      # UTC 偶数小时整点；私有仓 schedule 正常生效
+  workflow_dispatch:            # 手动补一轮 / 派发大批量前预热池子
+
+permissions:
+  contents: write               # 写 proxies_cnb.txt
+  actions: write                # 显式 dispatch sync-to-cnb.yml
+
+concurrency:
+  group: gk-pool-keeper
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 探活并补充代理池（全程零直连）
+        id: refresh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 pool_keeper_run.py
+
+      - name: 触发 1:1 镜像同步
+        if: steps.refresh.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GITHUB_TOKEN 产生的 push 不会再触发 workflow（GitHub 防递归规则），
+          # 所以池文件变化后显式 dispatch 一次 sync-to-cnb，保证 CNB 侧同步。
+          gh workflow run sync-to-cnb.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo "已触发 sync-to-cnb"
