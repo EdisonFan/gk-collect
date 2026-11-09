@@ -35,7 +35,9 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 20
+      # 免费代理池稳态仅 ~80 个 IP：20 并发会互相踩踏（run #90 成功率 19%），
+      # 降到 5 复用验证批 5/6 的成功率；25 个组合由 Actions 自动分成 5 波排队。
+      max-parallel: 5
       matrix:
         combo: ${{ fromJSON(inputs.combos) }}
     steps:
