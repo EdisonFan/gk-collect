@@ -59,10 +59,12 @@ API_CONTENT = 'https://api.github.com/repos/%s/%s/contents/proxies_cnb.txt' % (O
 TARGET = 120
 MAX_POOL = 200
 TIMEOUT = 6
-WORKERS = 32
-BATCH = 40
-CANDIDATE_BUDGET = 800
-MAX_SECONDS = 180          # 整轮硬上限（workflow timeout-minutes: 6）
+WORKERS = 48               # 探活是 IO 密集，提高并发才能在预算内验证足够多候选
+BATCH = 60
+CANDIDATE_BUDGET = 1200
+MAX_SECONDS = 210          # 整轮硬上限（workflow timeout-minutes: 7）
+                           # 首轮 180s 只验证 480 个候选、补到 82；放宽到 210s
+                           # 约可验证 1100 个，命中 ~70 个可用，足以补回 120。
 IP_PORT = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$')
 
 
