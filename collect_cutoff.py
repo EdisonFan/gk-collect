@@ -37,6 +37,10 @@ G1 失败（连 BASE 都没取到）时不写结果文件，避免用空壳覆�
 完备划分，不依赖样本猜科类/批次。65-2026 7066 / 62-2025 7140 /
 62-2024 6534 / 65-2025 7867 / 13-2026 5778 / 44-2025 8495 /
 11-2021 1442 的 34 省 Σ 精确等于 BASE numFound，且无片 >4000 条。
+
+v5.2（job 内失效代理绕过）：连不上(conn_err)累计 DEAD_THRESHOLD 次的代理
+在本 job 进程内判死并跳过，不再反复拨；限流(1069/1074)不记不判死。状态
+只在进程内存，job 结束即消失，不改白名单文件、不改结果格式、不跨 job。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,6 +66,15 @@ QUERY_ROUNDS = 10                  # 单次查询最多轮换 10 个代理
 PROBE_ROUNDS = 8                   # 探测整体重试轮次
 MAX_PAGE_ROUNDS = 15               # 页补采轮次
 API = 'apidata/api/gk/score/province'
+
+# ---- job 内失效代理绕过（v5.2）----
+# 一个 job = 一个进程 = 一个 PROV-YEAR，进程退出状态自动消失。
+# 不落盘、不跨 job、不改 proxies_cnb.txt、不动 workflow / 共享层 / 结果格式。
+# 只针对 conn_err（连不上），连续 DEAD_THRESHOLD 次才判死；1069/1074 等
+# 限流是「通了但被拒」的可恢复响应，不记不判死。判死后本 job 内不再复活。
+DEAD_PROXIES = set()               # 已判死代理，轮换时直接跳过
+CONN_FAILS = {}                    # proxy -> 连续 conn_err 次数
+DEAD_THRESHOLD = 3
 
 # 34 个院校所在省级行政区代码，构成确定性完备划分
 PROVINCE_IDS = ['11', '12', '13', '14', '15', '21', '22', '23', '31', '32',
@@ -104,12 +117,29 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
 
     min_items>0 时做页级完整性校验：返回的记录数不足即视为失败并换代理，
     防止「code=0000 但 item 残缺/为空」的页混进 G4 造成隐性丢数据。
+
+    v5.2：轮换时跳过本 job 内已判死的代理（DEAD_PROXIES），跳过不占
+    QUERY_ROUNDS 额度；连不上累计 DEAD_THRESHOLD 次才判死，拿到任何响应
+    都清零连续失败计数，因此限流/业务错误码不会被误判为失效。
     """
     tag = (sum(ord(c) for c in json.dumps(extra, sort_keys=True, ensure_ascii=False))
            + page * 7 + seed)
     n = len(proxies)
-    for k in range(QUERY_ROUNDS):
-        px = proxies[(tag + k) % n]
+    usable = set(p for p in proxies if p is not None)
+    # 全部候选都判死时清空重来一轮，避免「明明还有号却全跳过」的死锁。
+    # 这是唯一的复活口子；正常情况下判死后本 job 内不再复活。
+    with lock:
+        if usable and DEAD_PROXIES.issuperset(usable):
+            DEAD_PROXIES.clear()
+            CONN_FAILS.clear()
+    tried, idx = 0, 0
+    # idx 最多扫一圈；tried 只计真正拨出去的次数，跳过死号不占 10 次额度。
+    while tried < QUERY_ROUNDS and idx < n:
+        px = proxies[(tag + idx) % n]
+        idx += 1
+        if px in DEAD_PROXIES:            # 无锁读：set 读原子，写均由 lock 保护
+            continue
+        tried += 1
         try:
             d = call(px, page, extra)
             code, dat = str(d.get('code')), d.get('data')
@@ -118,17 +148,24 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
                 if len(it) < min_items:
                     with lock:
                         stats['short_page'] += 1
+                        CONN_FAILS.pop(px, None)   # 连通了，只是页残缺
                     continue              # 页残缺，换下一个代理重来
                 with lock:
                     stats['ok'] += 1
+                    CONN_FAILS.pop(px, None)       # 成功即清零连续失败
                 return it, dat.get('numFound'), True
             with lock:
                 stats['throttled' if code in ('1069', '1074') else 'other'] += 1
+                CONN_FAILS.pop(px, None)           # 拿到响应 = 号是通的，不判死
             if code == '1069':
                 time.sleep(0.25)
         except Exception:
             with lock:
                 stats['conn_err'] += 1
+                if px is not None:                 # 直连(None)不算代理，不判死
+                    CONN_FAILS[px] = CONN_FAILS.get(px, 0) + 1
+                    if CONN_FAILS[px] >= DEAD_THRESHOLD:
+                        DEAD_PROXIES.add(px)
     try:                                  # 代理全挂，直连兜底
         d = call(None, page, extra)
         if str(d.get('code')) == '0000' and isinstance(d.get('data'), dict):
@@ -318,6 +355,8 @@ def collect_pages(leaves, proxies, stats, lock, t0):
 
 
 def main():
+    DEAD_PROXIES.clear()               # job 内状态重置（一个进程只跑一个组合）
+    CONN_FAILS.clear()
     proxies = [x.strip() for x in open('proxies_cnb.txt', encoding='utf-8') if x.strip()]
     random.seed('v5-%s-%s' % (PROV, YEAR))
     random.shuffle(proxies)
@@ -424,6 +463,10 @@ def main():
           (part_count, part_uniq_count, true_nf, base_nf,
            base_capped, gate['G4_count_match']), flush=True)
     print('  === 闸门 %s gate_pass=%s ===' % (gate, gate_pass), flush=True)
+    print('  [绕过] job 内判死代理 %d/%d（连续 %d 次连不上）；'
+          '进程内跳过，job 结束即释放，不落盘不跨 job' %
+          (len(DEAD_PROXIES), len([p for p in proxies if p is not None]),
+           DEAD_THRESHOLD), flush=True)
 
     # 达标 -> 落盘原始全量（一条不少，含接口内重复，count 严格等于 numFound）
     # 未达标 -> 增量暂存，最大化保留已采数据供下轮续采
