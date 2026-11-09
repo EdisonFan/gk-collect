@@ -1,32 +1,26 @@
 # GitHub  EdisonFan/gk-collect
-#   → CNB  cooledi/gk-data-archive   单向镜像（CNB 侧只读）
+#   → CNB  cooledi/gk-collect   完整 1:1 镜像（CNB 侧只读）
 #
 # 用法：放到 GitHub 仓库的 .github/workflows/sync-to-cnb.yml
 #
-# 相对通用镜像模板的 4 处适配（针对本项目，勿删）：
-#   1. 只镜像 cutoff-* 采集结果分支，**不推 main、不加 --prune**
-#      —— CNB 侧 main 是「中文归档目录 + MD 文档」，被 --force --prune 会覆盖/剪掉
-#   2. CNB 组名 cooledi ≠ GitHub owner EdisonFan，CNB_REPO 必须写死
-#   3. 显式 fetch 全部 cutoff-* 分支再推，避免 checkout 只拉当前分支导致漏推
-#   4. 触发方式用 workflow_run：采集器 collect.yml 用默认 GITHUB_TOKEN 推送
-#      cutoff-* 分支，而 GitHub 规定 GITHUB_TOKEN 产生的 push 不会再触发
-#      workflow（防递归），故 on.push 对本项目实际不生效。改由 gk-cutoff
-#      run 完成时触发；一次采集 run 只同步一次全量分支，比逐分支 push 更省。
-#
-# 启用前置（一次性）：GitHub → Settings → Secrets and variables → Actions
-#   → New repository secret，名称 CNB_TOKEN，值填 CNB 访问令牌
-#   （Git 用户名固定 cnb，CNB 只支持 HTTPS + 令牌，不支持 SSH）
-#   若误建成 CNB__TOKEN（双下划线）也会自动兼容
+# 设计要点（针对本项目，勿删）：
+#   1. CNB_REPO 与 GitHub repo 同名 gk-collect；组名 cooledi ≠ owner EdisonFan，须写死
+#   2. 完整镜像：main + 全部 cutoff-* 分支，--force --prune 保持逐 ref 一致
+#      —— CNB 侧不单独维护内容，GitHub 是唯一真源
+#   3. 触发用 workflow_run：采集器 collect.yml 用默认 GITHUB_TOKEN 推分支，
+#      GitHub 规定该 token 产生的 push 不会再触发 workflow（防递归），
+#      on.push 对 cutoff-* 实际无效，故由 gk-cutoff run 完成时触发
+#   4. 显式 fetch 全部分支再推，避免 checkout 只拉当前分支导致漏推
+#   5. main 变更（归档/代码更新）由 on.push 直接触发镜像
 
-name: Sync cutoff branches to CNB
+name: Sync gk-collect to CNB (1:1)
 
 on:
-  # 实际生效的自动触发：采集流水线完成后同步（不受 GITHUB_TOKEN 防递归影响）
   workflow_run:
     workflows: ['gk-cutoff']
     types: [completed]
   push:
-    branches: ['cutoff-*']   # 保留：若将来改用 PAT 推分支则自动生效
+    branches: ['main']
   workflow_dispatch:         # 手动补一次同步
 
 jobs:
@@ -36,17 +30,17 @@ jobs:
     permissions:
       contents: read
     concurrency:
-      group: sync-cutoff-to-cnb   # 所有 cutoff 分支串行推送，避免并发写冲突
+      group: sync-gk-collect-to-cnb   # 串行推送，避免并发写冲突
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Push cutoff branches to CNB
+      - name: Full mirror to CNB
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN || secrets.CNB__TOKEN }}
-          CNB_REPO: cooledi/gk-data-archive
+          CNB_REPO: cooledi/gk-collect
         run: |
           set -euo pipefail
           if [ -z "${CNB_TOKEN}" ]; then
@@ -54,7 +48,9 @@ jobs:
             exit 1
           fi
           git config --global http.postBuffer 524288000
-          git fetch --no-tags origin '+refs/heads/cutoff-*:refs/remotes/origin/cutoff-*'
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
           git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}.git"
-          # 只推 cutoff-* 分支；CNB 侧 main（中文归档）与其它分支保持不动
-          git push --force cnb '+refs/remotes/origin/cutoff-*:refs/heads/cutoff-*'
+          # 完整镜像 main + 全部 cutoff-* 结果分支；--prune 清掉 CNB 上源站已删的分支
+          git push --force --prune cnb \
+            '+refs/remotes/origin/main:refs/heads/main' \
+            '+refs/remotes/origin/cutoff-*:refs/heads/cutoff-*'
