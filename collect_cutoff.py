@@ -8,16 +8,25 @@
   v5 = province_id 34 省确定性完备切分 + 四道闸门，任一不过不算完成
 
 零丢失定义（单个 PROV-YEAR）：
-  numFound = 无筛选查询给出的应采总条数
-  count    = 去重后实际落盘条数
-  必须 count == numFound，且中间每一步可审计、可复算。
+  true_nf  = 应采总条数（BASE 未封顶时取 BASE，封顶时取 34 省分片 Σ）
+  count    = 落盘的原始记录条数（含接口内重复，不去重）
+  必须 count == true_nf，且中间每一步可审计、可复算。
+
+BASE 封顶特例（v5.1，实测 41-2025 / 51-2025）：
+  无筛选查询的 numFound 被接口截断在 10000，是假总数；而 34 省分片各自
+  未封顶，Σ=10097 / 11327 才是真值。旧逻辑强制「Σ == BASE」使 G2 永远
+  判死、一条页都没采（partition_count=0，count 只是上轮 prev 增量）。
+  现改为：BASE 达到 NUMFOUND_CAP 且所有分片均未封顶时，以 Σ 分片为守恒
+  基准；若某分片自身仍封顶，则 Σ 也不可信，明确判失败等待更细切分，
+  绝不拿假数凑合、绝不降级为"覆盖率够就算完成"。
 
 四道闸门：
   G1 base      无筛选首页成功取到 numFound（重试 PROBE_ROUNDS 轮）
-  G2 partition 34 省探测零失败 且 Σ 省 numFound == BASE numFound；
+  G2 partition 34 省探测零失败 + 无封顶分片 + 守恒基准成立
+               （BASE 未封顶：Σ == BASE；BASE 封顶：Σ >= BASE 且以 Σ 为真值）
                >4000 条的片递归按科类/批次切分，每层同样验证 Σ 守恒
   G3 pages     所有页任务成功，失败页换代理补采到 0（MAX_PAGE_ROUNDS 轮）
-  G4 count     去重后 count == numFound
+  G4 count     页任务原始记录总数 part_count == true_nf
 
 gate_pass = G1 && G2 && G3 && G4。
 闸门未全过仍写结果文件并推分支（保留增量，绝不丢已采数据），但
@@ -46,6 +55,7 @@ YEAR = int(os.environ.get('YEAR', '2026'))
 SIZE = 20
 PAGE_CAP = 200
 ITEM_CAP = PAGE_CAP * SIZE          # 4000：单维度硬翻页上限
+NUMFOUND_CAP = 10000               # 接口无筛选 numFound 封顶值，达到即为不可信假总数
 TIMEOUT = 3
 WORKERS = 8
 QUERY_ROUNDS = 10                  # 单次查询最多轮换 10 个代理
@@ -202,10 +212,16 @@ def split_oversize(extra, label, parent_n, sample_items,
     return leaves, True
 
 
-def build_partition(base_nf, sample_items, proxies, stats, lock, t0, audit):
-    """34 省确定性完备切分 + Σ 守恒校验。返回 (leaves, complete)。
+def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0, audit):
+    """34 省确定性完备切分 + Σ 守恒校验。返回 (leaves, complete, true_nf)。
 
     leaves = [(extra, n, pages, label)]
+    true_nf = 本组合的应采总条数，G4 与结果 num_found 都以它为准。
+
+    BASE 未封顶：沿用原严格判据 Σ 省 == BASE。
+    BASE 封顶（>= NUMFOUND_CAP）：BASE 是接口截断产生的假总数，改以
+    「34 省分片 Σ」为真值。前提是每个分片自身都未封顶且探测零失败——
+    完备划分 + 各片未封顶，Σ 才等于真实总量；否则判 G2 失败。
     """
     specs = [({'province_id': pid}, 'p%s' % pid) for pid in PROVINCE_IDS]
     res = probe_strict_all(specs, proxies, stats, lock, '省', t0)
@@ -213,10 +229,24 @@ def build_partition(base_nf, sample_items, proxies, stats, lock, t0, audit):
     audit['prov_failed'] = [x[1] for x in res if not x[4]]
     audit['prov_sum'] = sum(x[2] for x in res)
     audit['base'] = base_nf
+    audit['base_capped'] = base_capped
     if audit['prov_failed']:
-        return [], False
-    if audit['prov_sum'] != base_nf:
-        return [], False
+        return [], False, 0
+    # 分片自身封顶 -> Σ 同样不可信，绝不拿它当基准
+    capped_provs = [(x[1], x[2]) for x in res if x[2] >= NUMFOUND_CAP]
+    audit['capped_provs'] = capped_provs
+    if capped_provs:
+        return [], False, 0
+    if base_capped:
+        # 真值只能 >= 被截断的 BASE；若反而更小，说明有片异常，判失败
+        if audit['prov_sum'] < base_nf:
+            return [], False, 0
+        true_nf = audit['prov_sum']
+    else:
+        if audit['prov_sum'] != base_nf:
+            return [], False, 0
+        true_nf = base_nf
+    audit['true_nf'] = true_nf
     leaves = []
     for e, l, n, it, ok in res:
         if n == 0:
@@ -227,11 +257,19 @@ def build_partition(base_nf, sample_items, proxies, stats, lock, t0, audit):
             sub, ok2 = split_oversize(e, l, n, sample_items,
                                       proxies, stats, lock, t0, audit)
             if not ok2:
-                return [], False
+                return [], False, 0
             leaves += sub
+    # 递归切分后的叶子若仍封顶，同样不能作为守恒计数基准
+    if any(n >= NUMFOUND_CAP for _, n, _, _ in leaves):
+        audit['capped_leaves'] = True
+        return [], False, 0
+    # 完备切分自检：所有叶子计划条数之和必须等于真值
+    if sum(n for _, n, _, _ in leaves) != true_nf:
+        audit['leaf_sum'] = sum(n for _, n, _, _ in leaves)
+        return [], False, 0
     audit['leaves'] = len(leaves)
     audit['pages'] = sum(x[2] for x in leaves)
-    return leaves, True
+    return leaves, True, true_nf
 
 
 def dedupe(items):
@@ -310,7 +348,11 @@ def main():
             base_ok, base_nf, sample = True, int(nf), list(items)
             break
         time.sleep(1.0)
-    print('  [G1] BASE numFound=%d ok=%s' % (base_nf, base_ok), flush=True)
+    base_capped = bool(base_ok and base_nf >= NUMFOUND_CAP)
+    print('  [G1] BASE numFound=%d ok=%s capped=%s%s' %
+          (base_nf, base_ok, base_capped,
+           '（接口截断假数，将以 34 省 Σ 为真值）' if base_capped else ''),
+          flush=True)
 
     # BASE 前 30 页样本：仅用于超限片递归切分时发现科类/批次实际值
     sample_items = list(sample)
@@ -327,16 +369,25 @@ def main():
 
     # ---- G2：34 省完备切分 ----
     audit = {}
-    leaves, part_ok = [], False
+    leaves, part_ok, true_nf = [], False, 0
     if base_ok:
-        leaves, part_ok = build_partition(base_nf, sample_items, proxies, stats,
-                                          lock, t0, audit)
-    print('  [G2] 完备切分 ok=%s 省Σ=%s BASE=%s 叶子=%s 页=%s' %
+        leaves, part_ok, true_nf = build_partition(
+            base_nf, base_capped, sample_items, proxies, stats, lock, t0, audit)
+    print('  [G2] 完备切分 ok=%s 省Σ=%s BASE=%s capped=%s 真值=%s 叶子=%s 页=%s' %
           (part_ok, audit.get('prov_sum'), audit.get('base'),
+           audit.get('base_capped'), audit.get('true_nf'),
            audit.get('leaves'), audit.get('pages')), flush=True)
     if audit.get('prov_failed'):
         print('  [G2] 探测失败省: %s' % ' '.join(audit['prov_failed']), flush=True)
-    if part_ok is False and audit.get('prov_sum') is not None \
+    if audit.get('capped_provs'):
+        print('  [G2] 分片自身封顶，Σ 不可信，需更细切分: %s' %
+              audit['capped_provs'], flush=True)
+    if audit.get('capped_leaves'):
+        print('  [G2] 递归切分后仍有封顶叶子，判失败', flush=True)
+    if audit.get('leaf_sum') is not None:
+        print('  [G2] 叶子计划条数 Σ=%s != 真值 %s' %
+              (audit['leaf_sum'], audit.get('true_nf')), flush=True)
+    if part_ok is False and not base_capped and audit.get('prov_sum') is not None \
             and audit.get('prov_sum') != audit.get('base'):
         print('  [G2] Σ 不守恒，差 %s 条' %
               (audit.get('base', 0) - audit.get('prov_sum', 0)), flush=True)
@@ -366,11 +417,12 @@ def main():
         'G1_base': base_ok,
         'G2_partition': part_ok,
         'G3_pages_zero_fail': bool(part_ok and len(failed) == 0),
-        'G4_count_match': bool(base_ok and part_ok and part_count == base_nf),
+        'G4_count_match': bool(base_ok and part_ok and part_count == true_nf),
     }
     gate_pass = all(gate.values())
-    print('  [G4] raw=%d uniq=%d numFound=%d ok=%s' %
-          (part_count, part_uniq_count, base_nf, gate['G4_count_match']), flush=True)
+    print('  [G4] raw=%d uniq=%d true_nf=%d (BASE=%d capped=%s) ok=%s' %
+          (part_count, part_uniq_count, true_nf, base_nf,
+           base_capped, gate['G4_count_match']), flush=True)
     print('  === 闸门 %s gate_pass=%s ===' % (gate, gate_pass), flush=True)
 
     # 达标 -> 落盘原始全量（一条不少，含接口内重复，count 严格等于 numFound）
@@ -389,12 +441,19 @@ def main():
              'num_found': 0, 'count': 0}, ensure_ascii=False), flush=True)
         return
 
+    # num_found 写守恒基准真值：封顶组合以 34 省 Σ 为准，不再是假 BASE。
+    # 未达标（G2 不过、true_nf=0）时保留 BASE，避免验收侧出现 nf=0 的误判。
+    nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'v5', 'prov': PROV, 'year': YEAR, 'api': API,
-        'num_found': base_nf, 'count': len(out_items),
+        'collector_rev': 'v5.1-capped-base',  # 仅审计标识，version 保持 v5 以兼容验收
+        'num_found': nf_out, 'count': len(out_items),
+        'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
+        'base_capped': base_capped,
+        'true_num_found': true_nf,       # 守恒基准真值（G4 判据）
         'partition_count': part_count,          # 页任务原始条数，G4 判据
         'dup_in_api': part_count - part_uniq_count,   # 接口数据内含重复条数，供审计
-        'coverage_pct': round(100.0 * len(out_items) / base_nf, 1) if base_nf else 0,
+        'coverage_pct': round(100.0 * len(out_items) / nf_out, 1) if nf_out else 0,
         'gate_pass': gate_pass, 'gate': gate,
         'partition': audit,
         'pages_total': audit.get('pages', 0), 'pages_ok': len(res),
@@ -409,11 +468,12 @@ def main():
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False)
-    print('=== 完成: %d/%d 条 / gate_pass=%s / 接口内重复 %d / %.0fs -> %s ===' %
-          (len(out_items), base_nf, gate_pass, out['dup_in_api'],
-           time.time() - t0, path), flush=True)
+    print('=== 完成: %d/%d 条 (BASE=%d capped=%s) / gate_pass=%s / 接口内重复 %d / %.0fs -> %s ===' %
+          (len(out_items), nf_out, base_nf, base_capped, gate_pass,
+           out['dup_in_api'], time.time() - t0, path), flush=True)
     print('RESULT_JSON ' + json.dumps(
-        {'prov': PROV, 'year': YEAR, 'count': len(out_items), 'num_found': base_nf,
+        {'prov': PROV, 'year': YEAR, 'count': len(out_items), 'num_found': nf_out,
+         'base_num_found': base_nf, 'base_capped': base_capped,
          'partition_count': part_count, 'dup_in_api': out['dup_in_api'],
          'gate_pass': gate_pass, 'gate': gate, 'pages_failed': len(failed)},
         ensure_ascii=False), flush=True)
