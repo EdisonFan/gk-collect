@@ -39,8 +39,13 @@ G1 失败（连 BASE 都没取到）时不写结果文件，避免用空壳覆�
 11-2021 1442 的 34 省 Σ 精确等于 BASE numFound，且无片 >4000 条。
 
 v5.2（job 内失效代理绕过）：连不上(conn_err)累计 DEAD_THRESHOLD 次的代理
-在本 job 进程内判死并跳过，不再反复拨；限流(1069/1074)不记不判死。状态
-只在进程内存，job 结束即消失，不改白名单文件、不改结果格式、不跨 job。
+在本 job 进程内判死并跳过，不再反复拨。状态只在进程内存，job 结束即消失，
+不改白名单文件、不改结果格式、不跨 job。
+
+v5.3（限流号判死）：run #91 实测限流(1069/1074)是主要失败源（44-2026
+throttled=4775 / conn_err=1631），被限流的号反复占用 QUERY_ROUNDS 额度，
+页补采 12 轮零进展。改为：连续 THROTTLE_DEAD_THRESHOLD 次限流的号也在本
+job 内判死跳过，把额度留给能返回数据的号；成功或全判死复活时清零。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,14 +72,21 @@ PROBE_ROUNDS = 8                   # 探测整体重试轮次
 MAX_PAGE_ROUNDS = 15               # 页补采轮次
 API = 'apidata/api/gk/score/province'
 
-# ---- job 内失效代理绕过（v5.2）----
+# ---- job 内失效代理绕过（v5.2 + v5.3 限流判死）----
 # 一个 job = 一个进程 = 一个 PROV-YEAR，进程退出状态自动消失。
 # 不落盘、不跨 job、不改 proxies_cnb.txt、不动 workflow / 共享层 / 结果格式。
-# 只针对 conn_err（连不上），连续 DEAD_THRESHOLD 次才判死；1069/1074 等
-# 限流是「通了但被拒」的可恢复响应，不记不判死。判死后本 job 内不再复活。
+# v5.2：conn_err（连不上）连续 DEAD_THRESHOLD 次判死。
+# v5.3：1069/1074 限流连续 THROTTLE_DEAD_THRESHOLD 次也判死。run #91 实测
+#       限流占失败请求的绝大多数（44-2026 throt=4775 / conn_err=1631），原逻辑
+#       把限流当「号是通的」并清零 conn 计数，限流号永远留在池里反复吃掉
+#       QUERY_ROUNDS 额度，页补采 12 轮零进展。判死后跳过不占额度，轮换自然
+#       收敛到真正能返回数据的号上。
+# 成功或全判死复活时清零；判死后本 job 内不再复活。
 DEAD_PROXIES = set()               # 已判死代理，轮换时直接跳过
 CONN_FAILS = {}                    # proxy -> 连续 conn_err 次数
 DEAD_THRESHOLD = 3
+THROTTLE_FAILS = {}                # proxy -> 连续 1069/1074 次数
+THROTTLE_DEAD_THRESHOLD = 3        # 连续限流达此数即本 job 内判死跳过
 
 # 34 个院校所在省级行政区代码，构成确定性完备划分
 PROVINCE_IDS = ['11', '12', '13', '14', '15', '21', '22', '23', '31', '32',
@@ -123,8 +135,12 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
     防止「code=0000 但 item 残缺/为空」的页混进 G4 造成隐性丢数据。
 
     v5.2：轮换时跳过本 job 内已判死的代理（DEAD_PROXIES），跳过不占
-    QUERY_ROUNDS 额度；连不上累计 DEAD_THRESHOLD 次才判死，拿到任何响应
-    都清零连续失败计数，因此限流/业务错误码不会被误判为失效。
+    QUERY_ROUNDS 额度；连不上累计 DEAD_THRESHOLD 次才判死。
+
+    v5.3：1069/1074 限流也累计，连续 THROTTLE_DEAD_THRESHOLD 次即判死跳过。
+    run #91 里限流号被「拿到响应=号是通的」反复清零、始终不判死，长期霸占
+    QUERY_ROUNDS 额度（44-2026 页补采 12 轮零进展）。判死后跳过不占额度，
+    10 次轮换能真正拨到还没被限流的号上。只有合法完整响应才清零限流计数。
     """
     tag = (sum(ord(c) for c in json.dumps(extra, sort_keys=True, ensure_ascii=False))
            + page * 7 + seed)
@@ -136,6 +152,7 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
         if usable and DEAD_PROXIES.issuperset(usable):
             DEAD_PROXIES.clear()
             CONN_FAILS.clear()
+            THROTTLE_FAILS.clear()
     tried, idx = 0, 0
     # idx 最多扫一圈；tried 只计真正拨出去的次数，跳过死号不占 10 次额度。
     while tried < QUERY_ROUNDS and idx < n:
@@ -153,14 +170,24 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
                     with lock:
                         stats['short_page'] += 1
                         CONN_FAILS.pop(px, None)   # 连通了，只是页残缺
+                        THROTTLE_FAILS.pop(px, None)   # code=0000 说明号未被限流
                     continue              # 页残缺，换下一个代理重来
                 with lock:
                     stats['ok'] += 1
                     CONN_FAILS.pop(px, None)       # 成功即清零连续失败
+                    THROTTLE_FAILS.pop(px, None)   # v5.3：合法完整响应才清零连续限流
                 return it, dat.get('numFound'), True
             with lock:
-                stats['throttled' if code in ('1069', '1074') else 'other'] += 1
-                CONN_FAILS.pop(px, None)           # 拿到响应 = 号是通的，不判死
+                thr = code in ('1069', '1074')
+                stats['throttled' if thr else 'other'] += 1
+                CONN_FAILS.pop(px, None)           # 拿到响应 = 号是通的，不算连接失败
+                if thr:
+                    # v5.3：连续限流的号判死跳过，避免长期霸占 QUERY_ROUNDS 额度
+                    THROTTLE_FAILS[px] = THROTTLE_FAILS.get(px, 0) + 1
+                    if THROTTLE_FAILS[px] >= THROTTLE_DEAD_THRESHOLD:
+                        DEAD_PROXIES.add(px)
+                else:
+                    THROTTLE_FAILS.pop(px, None)   # 其它业务码不算连续限流
             if code == '1069':
                 time.sleep(0.25)
         except Exception:
@@ -354,6 +381,7 @@ def collect_pages(leaves, proxies, stats, lock, t0):
 def main():
     DEAD_PROXIES.clear()               # job 内状态重置（一个进程只跑一个组合）
     CONN_FAILS.clear()
+    THROTTLE_FAILS.clear()
     proxies = [x.strip() for x in open('proxies_cnb.txt', encoding='utf-8') if x.strip()]
     random.seed('v5-%s-%s' % (PROV, YEAR))
     random.shuffle(proxies)
