@@ -65,11 +65,24 @@ v5.3（限流号判死）：run #91 实测限流(1069/1074)是主要失败源（
 throttled=4775 / conn_err=1631），被限流的号反复占用 QUERY_ROUNDS 额度，
 页补采 12 轮零进展。改为：连续 THROTTLE_DEAD_THRESHOLD 次限流的号也在本
 job 内判死跳过，把额度留给能返回数据的号；成功或全判死复活时清零。
+
+special-v1.1（响应体超长自适应 size）：专业线记录字段多（含专业名、选科
+编码等），同一分片 size=20 时响应 JSON 可能超过接口 30000 字符上限，接口
+直接返回 code=1090「(api)数据长度超过30000个字符」且不返回 item/numFound
+（实测 44-2026 的 p44 片：size=20 → 1090，size=10 → numFound=1328）。
+run #1 专业线验证批即因此在 p44 片上 8 轮探测全败、G2 判死、一页未采。
+1090 与代理无关（换号照样 1090），只能靠减小 size 解决；翻页上限硬编码
+200 页且与 size 无关，故 size=10 时单片容量降为 2000 条，片级容量必须
+按 ceil(n/size) <= PAGE_CAP 校验，超出则必须继续切分。
+本版：探测期按 SIZE_LADDER 自动降 size 并把 size 记入 leaf；采集期若某页
+才撞 1090，则该片整片降 size 重采（size 与页码绑定，改 size 会页内容错位）。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-U = 'https://api.zjzw.cn/web/api/'
+# 接口基址：默认生产地址；GK_API_BASE 仅供本地 mock 端到端测试覆盖
+# （https 走代理需 CONNECT 隧道，mock 用 http 可免隧道，不影响线上行为）。
+U = os.environ.get('GK_API_BASE', 'https://api.zjzw.cn/web/api/')
 H = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
@@ -83,6 +96,7 @@ YEAR = int(os.environ.get('YEAR', '2026'))
 SIZE = 20
 PAGE_CAP = 200
 ITEM_CAP = PAGE_CAP * SIZE          # 4000：单维度硬翻页上限
+SIZE_LADDER = (20, 10, 5)            # 响应体超长(1090)时的 size 降级阶梯
 NUMFOUND_CAP = 10000               # 接口无筛选 numFound 封顶值，达到即为不可信假总数
 TIMEOUT = 3
 WORKERS = 8
@@ -144,7 +158,8 @@ def call(proxy, page, extra):
         return json.loads(r.read().decode('utf-8'))
 
 
-def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
+def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0,
+                 size_hint=None):
     """严格查询：轮换代理直到拿到合法且完整的响应，绝不静默吞掉失败。
 
     返回 (items, numFound|None, ok)。numFound=0 是合法成功（空片），
@@ -161,6 +176,11 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
     QUERY_ROUNDS 额度（44-2026 页补采 12 轮零进展）。判死后跳过不占额度，
     10 次轮换能真正拨到还没被限流的号上。只有合法完整响应才清零限流计数。
     """
+    # special-v1.1：响应体超长降级。1090 与代理无关，换号照样 1090，
+    # 所以不做代理轮换重试，立即回传 code 交上层降 size 重试。
+    used_size = int(size_hint or extra.get('size') or SIZE)
+    extra = dict(extra)
+    extra['size'] = used_size
     tag = (sum(ord(c) for c in json.dumps(extra, sort_keys=True, ensure_ascii=False))
            + page * 7 + seed)
     n = len(proxies)
@@ -195,7 +215,7 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
                     stats['ok'] += 1
                     CONN_FAILS.pop(px, None)       # 成功即清零连续失败
                     THROTTLE_FAILS.pop(px, None)   # v5.3：合法完整响应才清零连续限流
-                return it, dat.get('numFound'), True
+                return it, dat.get('numFound'), True, '0000', used_size
             with lock:
                 thr = code in ('1069', '1074')
                 stats['throttled' if thr else 'other'] += 1
@@ -207,6 +227,11 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
                         DEAD_PROXIES.add(px)
                 else:
                     THROTTLE_FAILS.pop(px, None)   # 其它业务码不算连续限流
+            if code == '1090':
+                # 响应体超长：与代理无关，立即回传交上层降 size
+                with lock:
+                    stats['oversize'] = stats.get('oversize', 0) + 1
+                return [], None, False, '1090', used_size
             if code == '1069':
                 time.sleep(0.25)
         except Exception:
@@ -221,14 +246,36 @@ def query_strict(page, extra, proxies, stats, lock, seed=0, min_items=0):
     # 出口 IP 打目标站，再被 relay/巡航反复重派放大，已移除。
     with lock:
         stats['query_failed'] += 1
-    return [], None, False
+    return [], None, False, None, used_size
+
+
+def probe_slice(extra, label, proxies, stats, lock, seed=0, sizes=None):
+    """探测单个分片的 numFound，并对响应体超长(1090)自动降 size 重试。
+
+    numFound 与 size 无关（实测 p44 片 size=10/5 同为 1328；p41 片
+    size=10/20 同为 7837），故降 size 只影响响应体长度，不影响守恒基准。
+
+    返回 (numFound, size, ok, code, items)。非 1090 的失败不在本函数内
+    重试（换 size 没用），交由 probe_strict_all 换 seed 重试。
+    """
+    ladder = sizes or SIZE_LADDER
+    last_code = None
+    for sz in ladder:
+        items, nf, ok, code, _used = query_strict(
+            1, dict(extra, size=sz), proxies, stats, lock, seed)
+        if ok and nf is not None:
+            return int(nf), sz, True, code, items
+        last_code = code
+        if code != '1090':
+            return 0, sz, False, code, []
+    return 0, ladder[-1], False, last_code, []
 
 
 def probe_strict_all(specs, proxies, stats, lock, phase, t0):
     """并发严格探测：所有 spec 必须成功；未成功的换 seed 重试。
 
     specs: [(extra, label)]，label 必须唯一。
-    返回 [(extra, label, n, items, ok)]，顺序与 specs 一致；
+    返回 [(extra, label, n, items, ok, size)]，顺序与 specs 一致；
     探测失败的片明确 ok=False（不再静默跳过），交由 G2 判死。
     """
     done = {}
@@ -237,19 +284,20 @@ def probe_strict_all(specs, proxies, stats, lock, phase, t0):
         if not pending:
             break
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = {ex.submit(query_strict, 1, e, proxies, stats, lock, rnd * 131): (e, l)
+            futs = {ex.submit(probe_slice, e, l, proxies, stats, lock,
+                              rnd * 131): (e, l)
                     for e, l in pending}
             for f in as_completed(futs):
                 e, l = futs[f]
-                items, nf, ok = f.result()
-                if ok and nf is not None:
-                    done[l] = (e, l, int(nf), items, True)
+                n, sz, ok, code, items = f.result()
+                if ok and n is not None:
+                    done[l] = (e, l, int(n), items, True, sz)
         pending = [(e, l) for e, l in pending if l not in done]
         print('  [探测 %s 轮%d] 成功 %d/%d | %.0fs' %
               (phase, rnd + 1, len(done), len(specs), time.time() - t0), flush=True)
     res = []
     for e, l in specs:
-        res.append(done[l] if l in done else (e, l, 0, [], False))
+        res.append(done[l] if l in done else (e, l, 0, [], False, SIZE))
     return res
 
 
@@ -272,7 +320,7 @@ def split_oversize(extra, label, parent_n, sample_items,
         })
         if any(not x[4] for x in res) or sum(x[2] for x in res) != pn:
             return None
-        return [(e2, l2, n) for e2, l2, n, it2, ok in res if n > 0]
+        return [(e2, l2, n, sz) for e2, l2, n, it2, ok, sz in res if n > 0]
 
     # 专业线：批次优先、科类兜底（与投档线 v5 顺序相反）。
     # 实测 41-2025 p41 大片 7837 按科类切 Σ=7817 不守恒（漏艺术类 20 条），
@@ -281,17 +329,18 @@ def split_oversize(extra, label, parent_n, sample_items,
     if lv1 is None:
         return [], False
     leaves = []
-    for e2, l2, n in lv1:
-        if n <= ITEM_CAP:
-            leaves.append((e2, n, (n + SIZE - 1) // SIZE, l2))
+    for e2, l2, n, sz in lv1:
+        # 容量按该片自己的 size 算：翻页硬上限 PAGE_CAP 页，size 越小容量越小
+        if n <= PAGE_CAP * sz:
+            leaves.append((e2, n, (n + sz - 1) // sz, l2, sz))
         else:
             lv2 = one_level(e2, l2, n, 'local_type_name', CANDIDATE_TYPES)
             if lv2 is None:
                 return [], False
-            for e3, l3, n3 in lv2:
-                if n3 > ITEM_CAP:
+            for e3, l3, n3, sz3 in lv2:
+                if n3 > PAGE_CAP * sz3:
                     return [], False      # 再超限 -> G2 失败，等待重派
-                leaves.append((e3, n3, (n3 + SIZE - 1) // SIZE, l3))
+                leaves.append((e3, n3, (n3 + sz3 - 1) // sz3, l3, sz3))
     return leaves, True
 
 
@@ -309,6 +358,7 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
     specs = [({'province_id': pid}, 'p%s' % pid) for pid in PROVINCE_IDS]
     res = probe_strict_all(specs, proxies, stats, lock, '省', t0)
     audit['provinces'] = {x[1][1:]: x[2] for x in res}
+    audit['prov_sizes'] = {x[1][1:]: x[5] for x in res}
     audit['prov_failed'] = [x[1] for x in res if not x[4]]
     audit['prov_sum'] = sum(x[2] for x in res)
     audit['base'] = base_nf
@@ -331,11 +381,12 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
         true_nf = base_nf
     audit['true_nf'] = true_nf
     leaves = []
-    for e, l, n, it, ok in res:
+    for e, l, n, it, ok, sz in res:
         if n == 0:
             continue                      # 合法空片，不产生页任务
-        if n <= ITEM_CAP:
-            leaves.append((e, n, (n + SIZE - 1) // SIZE, l))
+        # 容量按该片自己的 size 算（size=10 时单片上限 2000 条）
+        if n <= PAGE_CAP * sz:
+            leaves.append((e, n, (n + sz - 1) // sz, l, sz))
         else:
             sub, ok2 = split_oversize(e, l, n, sample_items,
                                       proxies, stats, lock, t0, audit)
@@ -343,12 +394,12 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
                 return [], False, 0
             leaves += sub
     # 递归切分后的叶子若仍封顶，同样不能作为守恒计数基准
-    if any(n >= NUMFOUND_CAP for _, n, _, _ in leaves):
+    if any(n >= NUMFOUND_CAP for _, n, _, _, _ in leaves):
         audit['capped_leaves'] = True
         return [], False, 0
     # 完备切分自检：所有叶子计划条数之和必须等于真值
-    if sum(n for _, n, _, _ in leaves) != true_nf:
-        audit['leaf_sum'] = sum(n for _, n, _, _ in leaves)
+    if sum(n for _, n, _, _, _ in leaves) != true_nf:
+        audit['leaf_sum'] = sum(n for _, n, _, _, _ in leaves)
         return [], False, 0
     audit['leaves'] = len(leaves)
     audit['pages'] = sum(x[2] for x in leaves)
@@ -369,31 +420,68 @@ def dedupe(items):
 def collect_pages(leaves, proxies, stats, lock, t0):
     """页任务全采，失败页换代理补采到 0。返回 (res, failed)。
 
-    每个页任务带 expected：非末页须满 SIZE 条，末页须为该片余数条；
+    每个页任务带 expected：非末页须满该片 size 条，末页须为该片余数条；
     不足即由 query_strict 换代理重试，保证 G4 的原始条数守恒可达成。
+
+    special-v1.1：每片带独立 size。若采集中途某页才撞 1090（响应体超长），
+    该片整片按更小 size 重采——size 与页码绑定，改 size 后页内容错位，
+    不能只补失败页，必须作废旧 size 的全部页后整片重来。
     """
-    jobs = []
-    for extra, n, pages, label in leaves:
-        for p in range(1, pages + 1):
-            exp = SIZE if p < pages else n - (pages - 1) * SIZE
-            jobs.append((p, extra, label, exp))
-    total = len(jobs)
-    res, failed = {}, list(jobs)
+    slices = {}
+    for extra, n, pages, label, sz in leaves:
+        slices[label] = {'extra': extra, 'n': n, 'size': sz, 'pages': pages}
+    res = {}
+    failed = []
+    for label, st in slices.items():
+        for p in range(1, st['pages'] + 1):
+            failed.append((label, p))
     for rnd in range(1, MAX_PAGE_ROUNDS + 1):
         if not failed:
             break
+        jobs = []
+        for label, p in failed:
+            st = slices[label]
+            exp = (st['size'] if p < st['pages']
+                   else st['n'] - (st['pages'] - 1) * st['size'])
+            jobs.append((label, p, st['extra'], exp, st['size']))
+        total = sum(st['pages'] for st in slices.values())
+        new_failed = []
+        oversize = set()
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = {ex.submit(query_strict, p, e, proxies, stats, lock,
-                              rnd * 977, exp): (p, e, l, exp)
-                    for p, e, l, exp in failed}
-            new_failed = []
+            futs = {ex.submit(query_strict, p, dict(e, size=sz), proxies, stats,
+                              lock, rnd * 977, exp, sz): (label, p, e, exp, sz)
+                    for label, p, e, exp, sz in jobs}
             for f in as_completed(futs):
-                p, e, l, exp = futs[f]
-                items, nf, ok = f.result()
+                label, p, e, exp, sz = futs[f]
+                items, nf, ok, code, usz = f.result()
                 if ok:
-                    res[(l, p)] = items
+                    res[(label, p)] = items
                 else:
-                    new_failed.append((p, e, l, exp))
+                    if code == '1090':
+                        oversize.add(label)
+                    new_failed.append((label, p))
+        # 1090 的片：整片降 size 重采（作废旧 size 的全部页）
+        for label in oversize:
+            st = slices[label]
+            new_sz = st['size'] // 2
+            if new_sz < SIZE_LADDER[-1]:
+                print('  [页] 片 %s 响应体超长且 size 已到下限，判失败' % label,
+                      flush=True)
+                continue
+            new_pages = (st['n'] + new_sz - 1) // new_sz
+            if new_pages > PAGE_CAP:
+                print('  [页] 片 %s 降 size=%d 后需 %d 页 > %d，判失败（需更细切分）'
+                      % (label, new_sz, new_pages, PAGE_CAP), flush=True)
+                continue
+            print('  [页] 片 %s 响应体超长(1090)，整片降 size %d -> %d 重采'
+                  % (label, st['size'], new_sz), flush=True)
+            st['size'] = new_sz
+            st['pages'] = new_pages
+            for p in range(1, st['pages'] + 1):
+                res.pop((label, p), None)
+            new_failed = [(lb, pp) for lb, pp in new_failed if lb != label]
+            for p in range(1, new_pages + 1):
+                new_failed.append((label, p))
         failed = new_failed
         print('  [页 轮%d] 成功 %d/%d，仍失败 %d | %.0fs' %
               (rnd, len(res), total, len(failed), time.time() - t0), flush=True)
@@ -414,7 +502,8 @@ def main():
     lock = threading.Lock()
     stats = {'ok': 0, 'throttled': 0, 'other': 0, 'conn_err': 0,
              'direct': 0,  # 恒为 0：直连已禁用，保留键以兼容结果文件结构
-             'query_failed': 0, 'short_page': 0}
+             'query_failed': 0, 'short_page': 0,
+             'oversize': 0}  # 1090：响应体超长次数（size 自适应降级触发）
     t0 = time.time()
     os.makedirs('out', exist_ok=True)
     print('=== v5 零丢失采集 PROV=%s YEAR=%s 代理=%d 并发=%d ===' %
@@ -430,28 +519,30 @@ def main():
     print('  上轮增量基础 %d 条' % len(prev_items), flush=True)
 
     # ---- G1：BASE numFound ----
-    base_ok, base_nf, sample = False, 0, []
+    base_ok, base_nf, sample, base_size = False, 0, [], SIZE
     for rnd in range(PROBE_ROUNDS):
-        items, nf, ok = query_strict(1, {}, proxies, stats, lock, rnd * 31)
+        nf, sz, ok, code, items = probe_slice({}, 'BASE', proxies, stats, lock,
+                                             rnd * 31)
         if ok and nf is not None:
-            base_ok, base_nf, sample = True, int(nf), list(items)
+            base_ok, base_nf, sample, base_size = True, int(nf), list(items), sz
             break
         time.sleep(1.0)
     base_capped = bool(base_ok and base_nf >= NUMFOUND_CAP)
-    print('  [G1] BASE numFound=%d ok=%s capped=%s%s' %
-          (base_nf, base_ok, base_capped,
+    print('  [G1] BASE numFound=%d ok=%s capped=%s size=%d%s' %
+          (base_nf, base_ok, base_capped, base_size,
            '（接口截断假数，将以 34 省 Σ 为真值）' if base_capped else ''),
           flush=True)
 
     # BASE 前 30 页样本：仅用于超限片递归切分时发现科类/批次实际值
     sample_items = list(sample)
     if base_ok:
-        last = min(31, (base_nf + SIZE - 1) // SIZE)
+        last = min(31, (base_nf + base_size - 1) // base_size)
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            futs = [ex.submit(query_strict, p, {}, proxies, stats, lock, 0)
+            futs = [ex.submit(query_strict, p, {'size': base_size}, proxies,
+                              stats, lock, 0)
                     for p in range(2, last + 1)]
             for f in as_completed(futs):
-                it, _, ok = f.result()
+                it, _, ok, _, _ = f.result()
                 if ok:
                     sample_items += it
         print('  样本 %d 条（仅用于超限片递归切分兜底）' % len(sample_items), flush=True)
@@ -539,7 +630,7 @@ def main():
     nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'special-v1', 'prov': PROV, 'year': YEAR, 'api': API,
-        'collector_rev': 'special-v1-batch-first',  # 审计标识
+        'collector_rev': 'special-v1.1-size-adaptive',  # 审计标识
         'num_found': nf_out, 'count': len(out_items),
         'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
         'base_capped': base_capped,
