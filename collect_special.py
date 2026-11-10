@@ -84,6 +84,16 @@ ok 仅 94~95——免费代理在 3s 超时下大量超时，被 DEAD_THRESHOLD=
 （如 13-2024 conn_err=9176/ok=2478）反而能跑完，说明是阈值过紧而非
 代理全坏。故：TIMEOUT 3→12s、DEAD_THRESHOLD 3→6、THROTTLE_DEAD_THRESHOLD
 3→5、QUERY_ROUNDS 10→16、WORKERS 8→5（单 job 内并发下调，减少同池互踩）。
+
+special-v1.3（科类优先切分 + 批次名实采）：v1.2 后 13-2021/13-2023/
+23-2024 仍 G2 失败。直连实测定位：13-2021 的 p13 片父片 numFound=5909，
+按批次名切 Σ=5891 少 18 条——漏的是「专科提前批」（18 条）；该省真实
+批次名还有「地方专项计划本科批」，与硬编码候选表里的「地方专项计划批」
+「高校专项计划批」写法不同，名字对不上必然漏采。改为：
+  1) 一级切分改成科类优先（物理 3352 + 历史 2539 + 艺术 18 = 5909，
+     与父片精确守恒；科类取值域小而稳定，远比批次名可靠）；
+  2) 二级批次切不再用硬编码表，改为翻页实采该片真实出现的批次名，
+     保证候选与接口字段完全一致。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -136,7 +146,8 @@ PROVINCE_IDS = ['11', '12', '13', '14', '15', '21', '22', '23', '31', '32',
                 '65', '71', '81', '82']
 # 仅当某省片 >4000 条时才启用，作为二级切分兜底
 CANDIDATE_TYPES = ['物理类', '历史类', '文科', '理科', '综合', '理工', '文史',
-                   '不分文理', '艺术类', '体育类', '物理科目组合', '历史科目组合']
+                   '不分文理', '艺术类', '体育类', '物理科目组合', '历史科目组合',
+                   '艺术类(不分文理)', '体育类(不分文理)']
 CANDIDATE_BATCHES = [
     '本科批', '专科批', '本科提前批', '专科提前批',
     '本科批A段', '本科批B段', '本科批C段', '专科批A段', '专科批B段', '专科批C段',
@@ -316,35 +327,74 @@ def split_oversize(extra, label, parent_n, sample_items,
     每层都验证「Σ 子片 numFound == 父片 numFound」且探测零失败；
     任何一层不守恒即返回 False，绝不凑合。
     """
-    def one_level(e0, l0, pn, dim, candidates):
+    def one_level(e0, l0, pn, dim, candidates, extra_cands=None):
         vals = {it.get(dim) for it in sample_items if it.get(dim)} | set(candidates)
         specs = [(dict(e0, **{dim: v}), '%s|%s=%s' % (l0, dim, v))
                  for v in sorted(vals)]
         res = probe_strict_all(specs, proxies, stats, lock, l0 + '/' + dim, t0)
+        s = sum(x[2] for x in res)
+        failed = [x[1] for x in res if not x[4]]
         audit.setdefault('splits', []).append({
             'parent': l0, 'dim': dim, 'parent_n': pn,
-            'sum': sum(x[2] for x in res),
-            'failed': [x[1] for x in res if not x[4]],
+            'sum': s, 'failed': failed,
         })
-        if any(not x[4] for x in res) or sum(x[2] for x in res) != pn:
-            return None
-        return [(e2, l2, n, sz) for e2, l2, n, it2, ok, sz in res if n > 0]
+        if failed or s != pn:
+            return None, s
+        return [(e2, l2, n, sz) for e2, l2, n, it2, ok, sz in res if n > 0], s
 
-    # 专业线：批次优先、科类兜底（与投档线 v5 顺序相反）。
-    # 实测 41-2025 p41 大片 7837 按科类切 Σ=7817 不守恒（漏艺术类 20 条），
-    # 按批次切 Σ=7837 守恒；批次中的本科批 4004 再按科类切 2969+1035 守恒。
-    lv1 = one_level(extra, label, parent_n, 'local_batch_name', CANDIDATE_BATCHES)
+    def discover_batches(e0, l0, pn):
+        """枚举该片真实出现的 local_batch_name 全集（翻页扫样本）。
+
+        硬编码候选表会漏名：实测 13-2021 的 p13 片真实批次含
+        「地方专项计划本科批」「专科提前批」，而候选表写的是
+        「地方专项计划批」「高校专项计划批」，名字对不上导致 Σ 少 18 条、
+        G2 判死。此处直接翻片收集实际出现的批次名，保证候选完备。
+        """
+        found = set()
+        for pg in range(1, PAGE_CAP + 1):
+            items, _nf, ok, _c, _sz = query_strict(
+                pg, dict(e0, size=SIZE), proxies, stats, lock, 7 * pg)
+            if not ok or not items:
+                break
+            for it in items:
+                b = it.get('local_batch_name')
+                if b:
+                    found.add(b)
+        audit.setdefault('batch_discovery', []).append({
+            'parent': l0, 'parent_n': pn, 'batches': sorted(found),
+        })
+        return found
+
+    # v1.3：科类优先、批次兜底（顺序与 v1.2 相反）。
+    # 实测 13-2021 p13 片（父片 5909）：按批次名切 Σ=5891 少 18 条（漏
+    # 「专科提前批」）；按科类切 物理类 3352 + 历史类 2539 + 艺术类 18
+    # = 5909，与父片精确守恒。科类取值域小且稳定（物理/历史/艺术/体育），
+    # 比批次名可靠得多，故改为科类优先。
+    # 科类片仍超限时再按批次切；批次名改用「翻页实采」而非硬编码表，
+    # 实采值与接口字段完全一致，不会再因名称写法不同而漏采。
+    lv1, s1 = one_level(extra, label, parent_n, 'local_type_name', CANDIDATE_TYPES)
     if lv1 is None:
         return [], False
     leaves = []
     for e2, l2, n, sz in lv1:
-        # 容量按该片自己的 size 算：翻页硬上限 PAGE_CAP 页，size 越小容量越小
+        # 容量按该片自己的 size 算（size=10 时单片上限 2000 条）
         if n <= PAGE_CAP * sz:
             leaves.append((e2, n, (n + sz - 1) // sz, l2, sz))
         else:
-            lv2 = one_level(e2, l2, n, 'local_type_name', CANDIDATE_TYPES)
+            real_batches = discover_batches(e2, l2, n)
+            cand = sorted(real_batches) or CANDIDATE_BATCHES
+            lv2, s2 = one_level(e2, l2, n, 'local_batch_name', cand)
             if lv2 is None:
-                return [], False
+                # 批次层不守恒：再退到科类细分（批次×科类笛卡尔积）
+                lv2b, s2b = one_level(e2, l2, n, 'local_type_name',
+                                      CANDIDATE_TYPES + ['艺术类', '体育类'])
+                if lv2b is None:
+                    return [], False
+                for e3, l3, n3, sz3 in lv2b:
+                    if n3 > PAGE_CAP * sz3:
+                        return [], False      # 再超限 -> G2 失败，等待重派
+                    leaves.append((e3, n3, (n3 + sz3 - 1) // sz3, l3, sz3))
+                continue
             for e3, l3, n3, sz3 in lv2:
                 if n3 > PAGE_CAP * sz3:
                     return [], False      # 再超限 -> G2 失败，等待重派
@@ -638,7 +688,7 @@ def main():
     nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'special-v1', 'prov': PROV, 'year': YEAR, 'api': API,
-        'collector_rev': 'special-v1.2-tolerant',  # 审计标识
+        'collector_rev': 'special-v1.3-type-first',  # 审计标识
         'num_found': nf_out, 'count': len(out_items),
         'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
         'base_capped': base_capped,
