@@ -334,7 +334,7 @@ def probe_strict_all(specs, proxies, stats, lock, phase, t0):
 
 
 def split_oversize(extra, label, parent_n, sample_items,
-                   proxies, stats, lock, t0, audit):
+                   proxies, stats, lock, t0, audit, parent_capped=False):
     """>4000 条的省片：先按科类切、仍超限再按批次切。
 
     每层都验证「Σ 子片 numFound == 父片 numFound」且探测零失败；
@@ -406,10 +406,13 @@ def split_oversize(extra, label, parent_n, sample_items,
         })
         return found
 
-    def split_by(e0, l0, pn, dim, fallback_cands):
+    def split_by(e0, l0, pn, dim, fallback_cands, capped=False):
         """按 dim 切分该片：候选 = 实采值 ∪ 兜底候选，逐个探测并验证 Σ 守恒。
 
         返回 (子片列表, Σ)。Σ 不等于 pn 即不守恒，调用方须换维度或失败。
+        capped=True 表示父片 numFound 是接口截断的假数（>=NUMFOUND_CAP），
+        此时没有守恒基准，本级只要求子片均未封顶且 Σ 严格大于假数；
+        完备性由调用方用「科类/批次两维度 Σ 相等」交叉验证。
         """
         discovered = discover_vals(e0, l0, pn, dim)
         vals = discovered | set(fallback_cands)
@@ -422,7 +425,11 @@ def split_oversize(extra, label, parent_n, sample_items,
             'parent': l0, 'dim': dim, 'parent_n': pn,
             'sum': s, 'failed': failed, 'discovered': len(discovered),
         })
-        if failed or s != pn:
+        if capped:
+            # 父片是假数：Σ 必须严格大于它，且子片自身不能再封顶
+            if failed or s <= pn or any(x[2] >= NUMFOUND_CAP for x in res):
+                return None, s
+        elif failed or s != pn:
             return None, s
         return [(e2, l2, n, sz) for e2, l2, n, it2, ok, sz in res if n > 0], s
 
@@ -434,10 +441,12 @@ def split_oversize(extra, label, parent_n, sample_items,
     # 继续用另一维度实采递归细分；每一级都以 Σ 守恒为唯一通过条件，
     # 任何一级不守恒即整片判失败，绝不凑合。
     leaves = []
+    plans = []          # (leaves, Σ)，封顶父片时收集两个维度做交叉验证
     for dim1, dim2, cands1, cands2 in (
             ('local_type_name', 'local_batch_name', CANDIDATE_TYPES, CANDIDATE_BATCHES),
             ('local_batch_name', 'local_type_name', CANDIDATE_BATCHES, CANDIDATE_TYPES)):
-        lv1, _s = split_by(extra, label, parent_n, dim1, cands1)
+        lv1, s1 = split_by(extra, label, parent_n, dim1, cands1,
+                           capped=parent_capped)
         if lv1 is None:
             continue                      # 该维度不守恒，换另一个维度再试
         leaves = []
@@ -459,7 +468,21 @@ def split_oversize(extra, label, parent_n, sample_items,
             if not ok_all:
                 break
         if ok_all:
-            return leaves, True
+            if not parent_capped:
+                return leaves, True       # 原行为不变，不做多余探测
+            plans.append((leaves, s1))
+    if parent_capped:
+        # 父片总数是接口截断的假数，没有守恒基准。两个独立维度切出的
+        # Σ 相等，才能说明候选值完备、没有静默漏片；否则宁可判失败。
+        sums = [x[1] for x in plans]
+        ok_cross = len(plans) == 2 and sums[0] == sums[1]
+        audit.setdefault('capped_cross', []).append({
+            'parent': label, 'false_total': parent_n,
+            'sums': sums, 'ok': ok_cross,
+        })
+        if not ok_cross:
+            return [], False
+        return plans[0][0], True
     return [], False
 
 
@@ -484,11 +507,27 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
     audit['base_capped'] = base_capped
     if audit['prov_failed']:
         return [], False, 0
-    # 分片自身封顶 -> Σ 同样不可信，绝不拿它当基准
+    # 分片自身封顶 -> 该省 numFound 是接口截断假数，不能直接计入 Σ。
+    # 按科类、批次两个维度分别二次切分，两维度 Σ 相等才作为该省真值。
     capped_provs = [(x[1], x[2]) for x in res if x[2] >= NUMFOUND_CAP]
     audit['capped_provs'] = capped_provs
-    if capped_provs:
-        return [], False, 0
+    capped_fixed, prov_sum = [], audit['prov_sum']
+    for e, l, n, it, ok, sz in res:
+        if n < NUMFOUND_CAP:
+            continue
+        sub, ok2 = split_oversize(e, l, n, sample_items,
+                                  proxies, stats, lock, t0, audit,
+                                  parent_capped=True)
+        if not ok2 or not sub:
+            return [], False, 0
+        st = sum(x[1] for x in sub)
+        if st <= n:
+            return [], False, 0
+        audit.setdefault('capped_true', []).append(
+            {'prov': l, 'false_total': n, 'true_total': st, 'leaves': len(sub)})
+        prov_sum = prov_sum - n + st
+        capped_fixed += sub
+    audit['prov_sum'] = prov_sum
     if base_capped:
         # 真值只能 >= 被截断的 BASE；若反而更小，说明有片异常，判失败
         if audit['prov_sum'] < base_nf:
@@ -501,6 +540,8 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
     audit['true_nf'] = true_nf
     leaves = []
     for e, l, n, it, ok, sz in res:
+        if n >= NUMFOUND_CAP:
+            continue                      # 封顶片已由 capped_fixed 处理
         if n == 0:
             continue                      # 合法空片，不产生页任务
         # 容量按该片自己的 size 算（size=10 时单片上限 2000 条）
@@ -512,6 +553,7 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
             if not ok2:
                 return [], False, 0
             leaves += sub
+    leaves += capped_fixed
     # 递归切分后的叶子若仍封顶，同样不能作为守恒计数基准
     if any(n >= NUMFOUND_CAP for _, n, _, _, _ in leaves):
         audit['capped_leaves'] = True
