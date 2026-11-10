@@ -94,6 +94,13 @@ special-v1.3（科类优先切分 + 批次名实采）：v1.2 后 13-2021/13-202
      与父片精确守恒；科类取值域小而稳定，远比批次名可靠）；
   2) 二级批次切不再用硬编码表，改为翻页实采该片真实出现的批次名，
      保证候选与接口字段完全一致。
+
+special-v1.4（实采递进切分，彻底弃用硬编码候选表）：v1.3 改成科类优先后，
+23-2024 的 p23 片按科类切 Σ=4428 仍少 160 条——该省存在硬编码候选表
+覆盖不到的科类取值。结论：任何单一维度的硬编码候选表都不可靠。
+改为：每一级切分先用翻页实采拿到该片真实出现的维度取值全集（∪兜底候选），
+再逐个探测并以 Σ 守恒为唯一通过条件；科类/批次两个维度互为备选，
+子片仍超限则换另一维度继续实采细分。任一级不守恒即整片判失败，绝不凑合。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -342,13 +349,16 @@ def split_oversize(extra, label, parent_n, sample_items,
             return None, s
         return [(e2, l2, n, sz) for e2, l2, n, it2, ok, sz in res if n > 0], s
 
-    def discover_batches(e0, l0, pn):
-        """枚举该片真实出现的 local_batch_name 全集（翻页扫样本）。
+    def discover_vals(e0, l0, pn, dim):
+        """翻页实采该片真实出现的 dim 取值全集。
 
         硬编码候选表会漏名：实测 13-2021 的 p13 片真实批次含
         「地方专项计划本科批」「专科提前批」，而候选表写的是
         「地方专项计划批」「高校专项计划批」，名字对不上导致 Σ 少 18 条、
-        G2 判死。此处直接翻片收集实际出现的批次名，保证候选完备。
+        G2 判死。此处直接翻片收集实际出现的取值，保证候选完备。
+
+        关键：翻页本身受 PAGE_CAP 限制，父片可能超出可翻范围，因此
+        实采只用于「补全候选集合」，最终仍以 Σ 守恒为唯一判据。
         """
         found = set()
         for pg in range(1, PAGE_CAP + 1):
@@ -357,49 +367,69 @@ def split_oversize(extra, label, parent_n, sample_items,
             if not ok or not items:
                 break
             for it in items:
-                b = it.get('local_batch_name')
-                if b:
-                    found.add(b)
-        audit.setdefault('batch_discovery', []).append({
-            'parent': l0, 'parent_n': pn, 'batches': sorted(found),
+                v = it.get(dim)
+                if v:
+                    found.add(v)
+        audit.setdefault('discovered', []).append({
+            'parent': l0, 'dim': dim, 'parent_n': pn, 'values': sorted(found),
         })
         return found
 
-    # v1.3：科类优先、批次兜底（顺序与 v1.2 相反）。
-    # 实测 13-2021 p13 片（父片 5909）：按批次名切 Σ=5891 少 18 条（漏
-    # 「专科提前批」）；按科类切 物理类 3352 + 历史类 2539 + 艺术类 18
-    # = 5909，与父片精确守恒。科类取值域小且稳定（物理/历史/艺术/体育），
-    # 比批次名可靠得多，故改为科类优先。
-    # 科类片仍超限时再按批次切；批次名改用「翻页实采」而非硬编码表，
-    # 实采值与接口字段完全一致，不会再因名称写法不同而漏采。
-    lv1, s1 = one_level(extra, label, parent_n, 'local_type_name', CANDIDATE_TYPES)
-    if lv1 is None:
-        return [], False
+    def split_by(e0, l0, pn, dim, fallback_cands):
+        """按 dim 切分该片：候选 = 实采值 ∪ 兜底候选，逐个探测并验证 Σ 守恒。
+
+        返回 (子片列表, Σ)。Σ 不等于 pn 即不守恒，调用方须换维度或失败。
+        """
+        discovered = discover_vals(e0, l0, pn, dim)
+        vals = discovered | set(fallback_cands)
+        specs = [(dict(e0, **{dim: v}), '%s|%s=%s' % (l0, dim, v))
+                 for v in sorted(vals)]
+        res = probe_strict_all(specs, proxies, stats, lock, l0 + '/' + dim, t0)
+        s = sum(x[2] for x in res)
+        failed = [x[1] for x in res if not x[4]]
+        audit.setdefault('splits', []).append({
+            'parent': l0, 'dim': dim, 'parent_n': pn,
+            'sum': s, 'failed': failed, 'discovered': len(discovered),
+        })
+        if failed or s != pn:
+            return None, s
+        return [(e2, l2, n, sz) for e2, l2, n, it2, ok, sz in res if n > 0], s
+
+    # v1.4：科类/批次「实采递进」切分。
+    # v1.3 改成科类优先后，23-2024 的 p23 片按科类切 Σ=4428 仍少 160 条，
+    # 说明该省存在硬编码候选表覆盖不到的科类取值。结论：任何单一维度的
+    # 硬编码候选表都不可靠，必须靠翻页实采拿真实取值全集。
+    # 策略：先按科类实采切分（不守恒则换批次实采切分），子片仍超限就
+    # 继续用另一维度实采递归细分；每一级都以 Σ 守恒为唯一通过条件，
+    # 任何一级不守恒即整片判失败，绝不凑合。
     leaves = []
-    for e2, l2, n, sz in lv1:
-        # 容量按该片自己的 size 算（size=10 时单片上限 2000 条）
-        if n <= PAGE_CAP * sz:
-            leaves.append((e2, n, (n + sz - 1) // sz, l2, sz))
-        else:
-            real_batches = discover_batches(e2, l2, n)
-            cand = sorted(real_batches) or CANDIDATE_BATCHES
-            lv2, s2 = one_level(e2, l2, n, 'local_batch_name', cand)
-            if lv2 is None:
-                # 批次层不守恒：再退到科类细分（批次×科类笛卡尔积）
-                lv2b, s2b = one_level(e2, l2, n, 'local_type_name',
-                                      CANDIDATE_TYPES + ['艺术类', '体育类'])
-                if lv2b is None:
-                    return [], False
-                for e3, l3, n3, sz3 in lv2b:
-                    if n3 > PAGE_CAP * sz3:
-                        return [], False      # 再超限 -> G2 失败，等待重派
-                    leaves.append((e3, n3, (n3 + sz3 - 1) // sz3, l3, sz3))
+    for dim1, dim2, cands1, cands2 in (
+            ('local_type_name', 'local_batch_name', CANDIDATE_TYPES, CANDIDATE_BATCHES),
+            ('local_batch_name', 'local_type_name', CANDIDATE_BATCHES, CANDIDATE_TYPES)):
+        lv1, _s = split_by(extra, label, parent_n, dim1, cands1)
+        if lv1 is None:
+            continue                      # 该维度不守恒，换另一个维度再试
+        leaves = []
+        ok_all = True
+        for e2, l2, n, sz in lv1:
+            # 容量按该片自己的 size 算（size=10 时单片上限 2000 条）
+            if n <= PAGE_CAP * sz:
+                leaves.append((e2, n, (n + sz - 1) // sz, l2, sz))
                 continue
+            lv2, _s2 = split_by(e2, l2, n, dim2, cands2)
+            if lv2 is None:
+                ok_all = False
+                break
             for e3, l3, n3, sz3 in lv2:
                 if n3 > PAGE_CAP * sz3:
-                    return [], False      # 再超限 -> G2 失败，等待重派
+                    ok_all = False       # 再超限 -> G2 失败，等待重派
+                    break
                 leaves.append((e3, n3, (n3 + sz3 - 1) // sz3, l3, sz3))
-    return leaves, True
+            if not ok_all:
+                break
+        if ok_all:
+            return leaves, True
+    return [], False
 
 
 def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0, audit):
@@ -688,7 +718,7 @@ def main():
     nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'special-v1', 'prov': PROV, 'year': YEAR, 'api': API,
-        'collector_rev': 'special-v1.3-type-first',  # 审计标识
+        'collector_rev': 'special-v1.4-discovered',  # 审计标识
         'num_found': nf_out, 'count': len(out_items),
         'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
         'base_capped': base_capped,
