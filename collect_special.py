@@ -101,6 +101,12 @@ special-v1.4（实采递进切分，彻底弃用硬编码候选表）：v1.3 改
 改为：每一级切分先用翻页实采拿到该片真实出现的维度取值全集（∪兜底候选），
 再逐个探测并以 Σ 守恒为唯一通过条件；科类/批次两个维度互为备选，
 子片仍超限则换另一维度继续实采细分。任一级不守恒即整片判失败，绝不凑合。
+
+special-v1.5（实采容错续扫）：v1.4 的 discover_vals 遇错即 break，一次限流
+就导致取值集严重不全——实测 23-2024 的 p23 片扫到第 19 页即遇限流中断，
+只拿到「物理类/历史类」两个值，漏掉「艺术类」，切分仍不守恒。改为：
+单页失败重试 3 轮、连续失败 12 页才停止、期间跳页续扫不丢弃已有取值，
+并记录 scanned_pages / failed_pages 供审计。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -357,21 +363,46 @@ def split_oversize(extra, label, parent_n, sample_items,
         「地方专项计划批」「高校专项计划批」，名字对不上导致 Σ 少 18 条、
         G2 判死。此处直接翻片收集实际出现的取值，保证候选完备。
 
+        v1.5 要点：翻页遇错（限流/连接失败）不能直接 break——一次限流就会
+        让取值集严重不全（实测 23-2024 的 p23 片扫到第 19 页遇限流即中断，
+        只拿到「物理类/历史类」两个值，漏掉「艺术类」）。改为：
+          1) 单页失败重试若干轮；
+          2) 连续失败累计到阈值才判定「扫不动了」，但仍继续跳页重试，
+             不放弃已收集到的取值；
+          3) 记录 scanned_pages / failed_pages 供审计。
         关键：翻页本身受 PAGE_CAP 限制，父片可能超出可翻范围，因此
         实采只用于「补全候选集合」，最终仍以 Σ 守恒为唯一判据。
         """
         found = set()
+        scanned = 0
+        failed = 0
+        consecutive = 0
         for pg in range(1, PAGE_CAP + 1):
-            items, _nf, ok, _c, _sz = query_strict(
-                pg, dict(e0, size=SIZE), proxies, stats, lock, 7 * pg)
-            if not ok or not items:
-                break
+            items = []
+            ok = False
+            for _ in range(3):                 # 单页重试
+                items, _nf, ok, _c, _sz = query_strict(
+                    pg, dict(e0, size=SIZE), proxies, stats, lock, 7 * pg)
+                if ok:
+                    break
+                time.sleep(0.5)
+            if not ok:
+                failed += 1
+                consecutive += 1
+                if consecutive >= 12:           # 连续失败过多，池可能整体失效
+                    break
+                continue                       # 跳到下一页继续试，不丢弃已有取值
+            consecutive = 0
+            if not items:
+                break                          # 正常翻页结束（空页）
+            scanned += 1
             for it in items:
                 v = it.get(dim)
                 if v:
                     found.add(v)
         audit.setdefault('discovered', []).append({
             'parent': l0, 'dim': dim, 'parent_n': pn, 'values': sorted(found),
+            'scanned_pages': scanned, 'failed_pages': failed,
         })
         return found
 
@@ -718,7 +749,7 @@ def main():
     nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'special-v1', 'prov': PROV, 'year': YEAR, 'api': API,
-        'collector_rev': 'special-v1.4-discovered',  # 审计标识
+        'collector_rev': 'special-v1.5-resilient',  # 审计标识
         'num_found': nf_out, 'count': len(out_items),
         'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
         'base_capped': base_capped,
