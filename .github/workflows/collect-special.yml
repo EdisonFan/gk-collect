@@ -27,11 +27,13 @@ jobs:
   collect:
     runs-on: ubuntu-latest
     # 专业线单组合记录数约为投档线的 4~6 倍（41-2025 Σ=40891 ≈ 2045 页），
-    # 60 分钟不够，放宽到 180 分钟；公用免费代理池 5 并发。
+    # 60 分钟不够放宽到 180；v1.7 起单省自身封顶需科类、批次两轮额外
+    # 维度探测，44 省实测 180 分钟仍不够，放宽到 300 分钟。
+    # （GitHub 单任务硬上限 360 分钟，留 60 分钟给推送与闸门校验。）
     # v1.2：max-parallel 5→3。run #3/#4 同时跑导致 10 个 job 共抢 130 个免费
     # 代理，conn_err 冲到 525 而成功仅 95，代理被超时误判死亡耗尽。
     # 降到 3 保证同一时刻只有 3 个 job 在池里跑。
-    timeout-minutes: 180
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 3
