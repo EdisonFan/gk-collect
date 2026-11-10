@@ -1,0 +1,129 @@
+name: gk-special
+run-name: "采集专业录取线 ${{ inputs.tag }}"
+
+# 专业录取线 apidata/api/gk/score/special。
+# 与 gk-cutoff 完全隔离：独立分支前缀 special-*、独立结果文件名 special_*.json、
+# 独立采集器 collect_special.py（由 v5.3 复制改造，按批次优先二次切分）。
+# 第一版不含自接力：小批验证用；全量时由 feed_special.py --force 重派未达标组合。
+
+on:
+  workflow_dispatch:
+    inputs:
+      combos:
+        description: 'JSON array of "prov-year"'
+        required: true
+        type: string
+        default: '[]'
+      tag:
+        description: '批次标签，便于日志识别'
+        required: false
+        type: string
+        default: 'manual'
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    # 专业线单组合记录数约为投档线的 4~6 倍（41-2025 Σ=40891 ≈ 2045 页），
+    # 60 分钟不够，放宽到 180 分钟；公用免费代理池 5 并发。
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        combo: ${{ fromJSON(inputs.combos) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 采集（special-v1 零丢失）
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          export PROV YEAR
+          echo "=== special $PROV-$YEAR ==="
+          mkdir -p out
+          BR="special-${PROV}-${YEAR}"
+          if git fetch -q --depth=1 origin "refs/heads/${BR}" 2>/dev/null; then
+            git show "FETCH_HEAD:out/special_${PROV}_${YEAR}.json" > out/prev.json 2>/dev/null || rm -f out/prev.json
+            echo "已读取上轮 $BR 结果作为增量基础"
+          fi
+          python3 collect_special.py
+
+      - name: 推送结果分支（闸门未过也保留增量）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          PROV="${COMBO%%-*}"
+          YEAR="${COMBO##*-}"
+          BR="special-${PROV}-${YEAR}"
+          F="out/special_${PROV}_${YEAR}.json"
+          if [ ! -s "$F" ]; then
+            echo "无结果文件（G1 失败），跳过推送，云端旧结果不变"
+            rm -f out/prev.json
+            exit 0
+          fi
+          GP=$(python3 -c "import json;print(json.load(open('$F')).get('gate_pass', False))")
+          OLD_GP="False"
+          if [ -s out/prev.json ]; then
+            OLD_GP=$(python3 -c "import json;print(json.load(open('out/prev.json')).get('gate_pass', False))" 2>/dev/null || echo False)
+          fi
+          if [ "$GP" = "False" ] && [ "$OLD_GP" = "True" ]; then
+            echo "新结果闸门未过，云端已有达标结果，跳过推送避免降级"
+            rm -f out/prev.json
+            exit 0
+          fi
+          git config user.email "gk-collect@users.noreply.github.com"
+          git config user.name "gk-collect"
+          git checkout -B "$BR"
+          git add -f "$F"
+          git commit -m "special ${PROV}-${YEAR} gate_pass=${GP}" || echo "无变更"
+          git push -f origin "HEAD:refs/heads/${BR}"
+          echo "已推送 $BR (gate_pass=${GP})"
+          rm -f out/prev.json
+
+      - name: 上传结果制品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: special-${{ matrix.combo }}
+          path: out/special_*.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: true
+
+      - name: 闸门校验（未全过则判失败，触发重派）
+        if: always()
+        shell: bash
+        env:
+          COMBO: ${{ matrix.combo }}
+        run: |
+          set -e
+          F="out/special_${COMBO%%-*}_${COMBO##*-}.json"
+          if [ ! -s "$F" ]; then
+            echo "::error::${COMBO} 无结果文件（G1 BASE 未取到），判失败待重派"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, sys
+          prov, year = os.environ['COMBO'].split('-', 1)
+          d = json.load(open('out/special_%s_%s.json' % (prov, year)))
+          print('闸门明细:', json.dumps(d.get('gate'), ensure_ascii=False))
+          print('numFound=%s count=%s partition_count=%s gate_pass=%s' %
+                (d.get('num_found'), d.get('count'), d.get('partition_count'),
+                 d.get('gate_pass')))
+          if not d.get('gate_pass'):
+              print('::error::%s-%s 闸门未全过，判失败待重派' % (prov, year))
+              sys.exit(1)
+          print('%s-%s 零丢失达标：count == numFound' % (prov, year))
+          PY
