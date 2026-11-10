@@ -56,7 +56,9 @@ jobs:
           BR="special-${PROV}-${YEAR}"
           if git fetch -q --depth=1 origin "refs/heads/${BR}" 2>/dev/null; then
             git show "FETCH_HEAD:out/special_${PROV}_${YEAR}.json" > out/prev.json 2>/dev/null || rm -f out/prev.json
-            echo "已读取上轮 $BR 结果作为增量基础"
+            # v1.6：取回上轮落盘的切分计划，重跑时跳过 135 分钟探测
+            git show "FETCH_HEAD:out/plan_${PROV}_${YEAR}.json" > out/partition_plan_prev.json 2>/dev/null || rm -f out/partition_plan_prev.json
+            echo "已读取上轮 $BR 结果与切分计划"
           fi
           python3 collect_special.py
 
@@ -71,28 +73,44 @@ jobs:
           YEAR="${COMBO##*-}"
           BR="special-${PROV}-${YEAR}"
           F="out/special_${PROV}_${YEAR}.json"
-          if [ ! -s "$F" ]; then
-            echo "无结果文件（G1 失败），跳过推送，云端旧结果不变"
-            rm -f out/prev.json
-            exit 0
-          fi
-          GP=$(python3 -c "import json;print(json.load(open('$F')).get('gate_pass', False))")
-          OLD_GP="False"
-          if [ -s out/prev.json ]; then
-            OLD_GP=$(python3 -c "import json;print(json.load(open('out/prev.json')).get('gate_pass', False))" 2>/dev/null || echo False)
-          fi
-          if [ "$GP" = "False" ] && [ "$OLD_GP" = "True" ]; then
-            echo "新结果闸门未过，云端已有达标结果，跳过推送避免降级"
-            rm -f out/prev.json
-            exit 0
+          PLAN="out/plan_${PROV}_${YEAR}.json"
+          # v1.6：采集器在 G2 完备切分成功后立即落盘切分计划。
+          # 大省探测实测耗时 135 分钟，job 撞 180 分钟被砍时结果文件不会
+          # 生成，但计划文件已在磁盘上。此时照样推计划，下轮复用即可跳过探测。
+          if [ -s out/partition_plan.json ]; then
+            cp out/partition_plan.json "$PLAN"
           fi
           git config user.email "gk-collect@users.noreply.github.com"
           git config user.name "gk-collect"
           git checkout -B "$BR"
-          git add -f "$F"
-          git commit -m "special ${PROV}-${YEAR} gate_pass=${GP}" || echo "无变更"
+          PUSHED=""
+          if [ -s "$F" ]; then
+            GP=$(python3 -c "import json;print(json.load(open('$F')).get('gate_pass', False))")
+            OLD_GP="False"
+            if [ -s out/prev.json ]; then
+              OLD_GP=$(python3 -c "import json;print(json.load(open('out/prev.json')).get('gate_pass', False))" 2>/dev/null || echo False)
+            fi
+            if [ "$GP" = "False" ] && [ "$OLD_GP" = "True" ]; then
+              echo "新结果闸门未过，云端已有达标结果，跳过结果推送避免降级"
+            else
+              git add -f "$F"
+              PUSHED="result(gate_pass=${GP})"
+            fi
+          else
+            echo "本轮无结果文件（采集未完成/超时），仅推送切分计划"
+          fi
+          if [ -s "$PLAN" ]; then
+            git add -f "$PLAN"
+            PUSHED="${PUSHED:+$PUSHED }plan"
+          fi
+          if [ -z "$PUSHED" ]; then
+            echo "无结果也无计划，跳过推送，云端旧结果不变"
+            rm -f out/prev.json
+            exit 0
+          fi
+          git commit -m "special ${PROV}-${YEAR} ${PUSHED}" || echo "无变更"
           git push -f origin "HEAD:refs/heads/${BR}"
-          echo "已推送 $BR (gate_pass=${GP})"
+          echo "已推送 $BR (${PUSHED})"
           rm -f out/prev.json
 
       - name: 上传结果制品
@@ -114,7 +132,14 @@ jobs:
           set -e
           F="out/special_${COMBO%%-*}_${COMBO##*-}.json"
           if [ ! -s "$F" ]; then
-            echo "::error::${COMBO} 无结果文件（G1 BASE 未取到），判失败待重派"
+            # 结果文件只在采完且闸门判完后写。探测阶段耗时长（大省实测 135 分钟）
+            # 或 job 撞 180 分钟超时被砍时，文件不会生成，但 G1 通常早已通过。
+            # 原报错写作「G1 BASE 未取到」会误导排查，此处如实描述。
+            if [ -s out/partition_plan.json ]; then
+              echo "::error::${COMBO} 采集未完成（探测耗时/超时被砍），切分计划已落盘，下轮复用跳过探测"
+            else
+              echo "::error::${COMBO} 无结果文件（采集未完成或 G1 未取到），判失败待重派"
+            fi
             exit 1
           fi
           python3 - <<'PY'

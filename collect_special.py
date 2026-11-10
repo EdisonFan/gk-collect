@@ -525,6 +525,75 @@ def build_partition(base_nf, base_capped, sample_items, proxies, stats, lock, t0
     return leaves, True, true_nf
 
 
+# ---- 探测计划落盘复用（v1.6）------------------------------------------
+# 13-2023 实测：G2 完备切分探测耗时 135.6 分钟（省 7 + 科类 58 + 批次 70），
+# 而结果文件只在采完且四闸门全过后才写。job 撞 180 分钟被砍时，这 135
+# 分钟算出的 42 个叶子 / 2398 页 / 真值 47551 全部丢失，重跑又从零探测。
+# 改动：G2 成功立即把叶子计划单独落盘；重跑时严格校验后直接复用，跳过探测。
+PLAN_NEW = 'out/partition_plan.json'        # 本轮生成，待 workflow 推送
+PLAN_PREV = 'out/partition_plan_prev.json'  # 上轮从结果分支取回
+
+
+def save_partition_plan(leaves, true_nf, base_nf, base_capped, audit):
+    """G2 完备切分成功后立即落盘，供被超时砍掉后重跑复用。"""
+    payload = {
+        'prov': PROV, 'year': YEAR,
+        'true_nf': true_nf,
+        'base_num_found': base_nf,
+        'base_capped': bool(base_capped),
+        'leaves': [[e, n, pages, label, sz]
+                   for e, n, pages, label, sz in leaves],
+        'audit': audit,
+        'collector_rev': 'special-v1.6-plan-reuse',
+        'created_at': time.strftime('%F %T'),
+    }
+    tmp = PLAN_NEW + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, PLAN_NEW)
+    print('  [计划落盘] %d 个叶子 / 真值 %d -> %s' %
+          (len(leaves), true_nf, PLAN_NEW), flush=True)
+
+
+def load_partition_plan():
+    """优先用本轮已生成的计划，其次用分支取回的上轮计划。"""
+    for p in (PLAN_PREV, PLAN_NEW):
+        try:
+            return json.load(open(p, encoding='utf-8'))
+        except Exception:
+            pass
+    return None
+
+
+def from_plan(plan, base_nf, base_capped):
+    """校验并重建 leaves；任何不一致都返回 False，回退正常探测路径。
+
+    复用路径必须满足与 build_partition 相同的全部约束，否则 G2 不算通过：
+    Σ叶子条数 == 真值、无封顶叶子、单叶子不超翻页容量、页数与条数自洽。
+    """
+    try:
+        if plan.get('prov') != PROV or int(plan.get('year')) != YEAR:
+            return [], False, 0
+        if plan.get('base_num_found') != base_nf:
+            return [], False, 0
+        if bool(plan.get('base_capped')) != bool(base_capped):
+            return [], False, 0
+        true_nf = int(plan['true_nf'])
+        leaves = [(e, int(n), int(pages), label, int(sz))
+                  for e, n, pages, label, sz in plan['leaves']]
+        if not leaves or sum(n for _, n, _, _, _ in leaves) != true_nf:
+            return [], False, 0
+        if any(n >= NUMFOUND_CAP for _, n, _, _, _ in leaves):
+            return [], False, 0
+        if any(n > PAGE_CAP * sz for _, n, _, _, sz in leaves):
+            return [], False, 0
+        if any(pages != (n + sz - 1) // sz for _, n, pages, _, sz in leaves):
+            return [], False, 0
+        return leaves, True, true_nf
+    except Exception:
+        return [], False, 0
+
+
 def dedupe(items):
     """按整条记录内容哈希去重，保持原顺序。"""
     seen, out = set(), []
@@ -652,9 +721,28 @@ def main():
            '（接口截断假数，将以 34 省 Σ 为真值）' if base_capped else ''),
           flush=True)
 
-    # BASE 前 30 页样本：仅用于超限片递归切分时发现科类/批次实际值
+    # ---- 探测计划复用（v1.6）----
+    # 大省完备切分探测实测吃掉 135.6 分钟，job 撞 180 分钟被砍后成果全丢。
+    # 优先载入上轮落盘的叶子计划，严格校验通过即跳过探测，直接翻页采集。
+    audit = {}
+    leaves, part_ok, true_nf = [], False, 0
+    plan_used = False
+    plan = load_partition_plan() if base_ok else None
+    if plan:
+        leaves, part_ok, true_nf = from_plan(plan, base_nf, base_capped)
+        if part_ok:
+            plan_used = True
+            audit = dict(plan.get('audit') or {})
+            audit['plan_reused'] = True
+            print('  [计划复用] 校验通过，跳过完备切分探测：%d 叶子 / %d 页 / 真值 %d' %
+                  (len(leaves), sum(x[2] for x in leaves), true_nf), flush=True)
+        else:
+            print('  [计划复用] 校验未通过（BASE 或切分约束不一致），回退正常探测', flush=True)
+
+    # BASE 前 30 页样本：仅用于超限片递归切分时发现科类/批次实际值。
+    # 复用计划时不需要样本，跳过可省下数分钟。
     sample_items = list(sample)
-    if base_ok:
+    if base_ok and not plan_used:
         last = min(31, (base_nf + base_size - 1) // base_size)
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             futs = [ex.submit(query_strict, p, {'size': base_size}, proxies,
@@ -665,17 +753,20 @@ def main():
                 if ok:
                     sample_items += it
         print('  样本 %d 条（仅用于超限片递归切分兜底）' % len(sample_items), flush=True)
+    elif plan_used:
+        print('  样本采集跳过（已复用切分计划）', flush=True)
 
     # ---- G2：34 省完备切分 ----
-    audit = {}
-    leaves, part_ok, true_nf = [], False, 0
-    if base_ok:
+    if base_ok and not plan_used:
         leaves, part_ok, true_nf = build_partition(
             base_nf, base_capped, sample_items, proxies, stats, lock, t0, audit)
-    print('  [G2] 完备切分 ok=%s 省Σ=%s BASE=%s capped=%s 真值=%s 叶子=%s 页=%s' %
+        if part_ok:
+            save_partition_plan(leaves, true_nf, base_nf, base_capped, audit)
+    print('  [G2] 完备切分 ok=%s 省Σ=%s BASE=%s capped=%s 真值=%s 叶子=%s 页=%s%s' %
           (part_ok, audit.get('prov_sum'), audit.get('base'),
            audit.get('base_capped'), audit.get('true_nf'),
-           audit.get('leaves'), audit.get('pages')), flush=True)
+           audit.get('leaves'), audit.get('pages'),
+           ' （复用计划）' if plan_used else ''), flush=True)
     if audit.get('prov_failed'):
         print('  [G2] 探测失败省: %s' % ' '.join(audit['prov_failed']), flush=True)
     if audit.get('capped_provs'):
@@ -749,7 +840,8 @@ def main():
     nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'special-v1', 'prov': PROV, 'year': YEAR, 'api': API,
-        'collector_rev': 'special-v1.5-resilient',  # 审计标识
+        'collector_rev': 'special-v1.6-plan-reuse' if plan_used else
+                         'special-v1.5-resilient',  # 审计标识
         'num_found': nf_out, 'count': len(out_items),
         'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
         'base_capped': base_capped,
