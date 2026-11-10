@@ -76,6 +76,14 @@ run #1 专业线验证批即因此在 p44 片上 8 轮探测全败、G2 判死�
 按 ceil(n/size) <= PAGE_CAP 校验，超出则必须继续切分。
 本版：探测期按 SIZE_LADDER 自动降 size 并把 size 记入 leaf；采集期若某页
 才撞 1090，则该片整片降 size 重采（size 与页码绑定，改 size 会页内容错位）。
+
+special-v1.2（放宽超时与死代理阈值）：run #3/#4 并发跑满 10 个 job 时，
+23-2024 / 23-2025 / 13-2021 三个组合闸门未过，统计显示 conn_err 448~525、
+ok 仅 94~95——免费代理在 3s 超时下大量超时，被 DEAD_THRESHOLD=3 连续
+三次误判死亡，短时间内把整池 130 个代理判死耗尽。同一批成功的组合
+（如 13-2024 conn_err=9176/ok=2478）反而能跑完，说明是阈值过紧而非
+代理全坏。故：TIMEOUT 3→12s、DEAD_THRESHOLD 3→6、THROTTLE_DEAD_THRESHOLD
+3→5、QUERY_ROUNDS 10→16、WORKERS 8→5（单 job 内并发下调，减少同池互踩）。
 """
 import os, json, time, random, threading, hashlib, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -98,9 +106,9 @@ PAGE_CAP = 200
 ITEM_CAP = PAGE_CAP * SIZE          # 4000：单维度硬翻页上限
 SIZE_LADDER = (20, 10, 5)            # 响应体超长(1090)时的 size 降级阶梯
 NUMFOUND_CAP = 10000               # 接口无筛选 numFound 封顶值，达到即为不可信假总数
-TIMEOUT = 3
-WORKERS = 8
-QUERY_ROUNDS = 10                  # 单次查询最多轮换 10 个代理
+TIMEOUT = 12                        # v1.2：免费代理响应慢，3s 误杀大量可用代理
+WORKERS = 5                         # v1.2：单 job 内并发下调，避免自相踩踏
+QUERY_ROUNDS = 16                   # 单次查询最多轮换 16 个代理
 PROBE_ROUNDS = 8                   # 探测整体重试轮次
 MAX_PAGE_ROUNDS = 15               # 页补采轮次
 API = 'apidata/api/gk/score/special'
@@ -117,9 +125,9 @@ API = 'apidata/api/gk/score/special'
 # 成功或全判死复活时清零；判死后本 job 内不再复活。
 DEAD_PROXIES = set()               # 已判死代理，轮换时直接跳过
 CONN_FAILS = {}                    # proxy -> 连续 conn_err 次数
-DEAD_THRESHOLD = 3
+DEAD_THRESHOLD = 6                 # v1.2：3 次太激进，慢代理被误判死亡清空整池
 THROTTLE_FAILS = {}                # proxy -> 连续 1069/1074 次数
-THROTTLE_DEAD_THRESHOLD = 3        # 连续限流达此数即本 job 内判死跳过
+THROTTLE_DEAD_THRESHOLD = 5        # v1.2：限流号判死放宽，减少误伤可用号
 
 # 34 个院校所在省级行政区代码，构成确定性完备划分
 PROVINCE_IDS = ['11', '12', '13', '14', '15', '21', '22', '23', '31', '32',
@@ -630,7 +638,7 @@ def main():
     nf_out = true_nf if part_ok else base_nf
     out = {
         'version': 'special-v1', 'prov': PROV, 'year': YEAR, 'api': API,
-        'collector_rev': 'special-v1.1-size-adaptive',  # 审计标识
+        'collector_rev': 'special-v1.2-tolerant',  # 审计标识
         'num_found': nf_out, 'count': len(out_items),
         'base_num_found': base_nf,       # 接口原始返回值（封顶时为假数，仅作审计）
         'base_capped': base_capped,
