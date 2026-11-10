@@ -5,11 +5,11 @@
 #
 # 设计要点（针对本项目，勿删）：
 #   1. CNB_REPO 与 GitHub repo 同名 gk-collect；组名 cooledi ≠ owner EdisonFan，须写死
-#   2. 完整镜像：main + 全部 cutoff-* 分支，--force --prune 保持逐 ref 一致
+#   2. 完整镜像：main + 全部 cutoff-* / special-* 分支，--force --prune 保持逐 ref 一致
 #      —— CNB 侧不单独维护内容，GitHub 是唯一真源
-#   3. 触发用 workflow_run：采集器 collect.yml 用默认 GITHUB_TOKEN 推分支，
+#   3. 触发用 workflow_run：采集器用默认 GITHUB_TOKEN 推分支，
 #      GitHub 规定该 token 产生的 push 不会再触发 workflow（防递归），
-#      on.push 对 cutoff-* 实际无效，故由 gk-cutoff run 完成时触发
+#      on.push 对结果分支实际无效，故由采集 run 完成时触发
 #   4. 显式 fetch 全部分支再推，避免 checkout 只拉当前分支导致漏推
 #   5. main 变更（归档/代码更新）由 on.push 直接触发镜像
 
@@ -17,7 +17,7 @@ name: Sync gk-collect to CNB (1:1)
 
 on:
   workflow_run:
-    workflows: ['gk-cutoff']
+    workflows: ['gk-cutoff', 'gk-special']
     types: [completed]
   push:
     branches: ['main']
@@ -50,7 +50,9 @@ jobs:
           git config --global http.postBuffer 524288000
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
           git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}.git"
-          # 完整镜像 main + 全部 cutoff-* 结果分支；--prune 清掉 CNB 上源站已删的分支
+          # 完整镜像 main + 全部结果分支（投档线 cutoff-* / 专业线 special-*）
+          # --prune 清掉 CNB 上源站已删的分支
           git push --force --prune cnb \
             '+refs/remotes/origin/main:refs/heads/main' \
-            '+refs/remotes/origin/cutoff-*:refs/heads/cutoff-*'
+            '+refs/remotes/origin/cutoff-*:refs/heads/cutoff-*' \
+            '+refs/remotes/origin/special-*:refs/heads/special-*'
