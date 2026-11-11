@@ -54,6 +54,7 @@ def remote_ok():
 
 
 def main():
+    global done, failed
     args = sys.argv[1:]
     limit = None; only = None
     if '--limit' in args: limit = int(args[args.index('--limit')+1])
