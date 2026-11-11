@@ -327,6 +327,33 @@ def test_static_contracts():
         '配置=%s 实际=%s' % (sorted(listed), sorted(actual)))
     chk('main 变更也触发同步（on.push）',
         re.search(r'push:\s*\n\s*branches:', sy) is not None)
+    # 本地采集器用 PAT 推 special-* 分支会触发 push；只放行 main 会让结果分支
+    # 一直停在 GitHub（2026-11-11 实测 special-64-2025 缺 15 分钟）。
+    pushm = re.search(r'push:\s*\n\s*branches:\s*\[([^\]]+)\]', sy)
+    pb = set(re.findall(r"'([^']+)'", pushm.group(1))) if pushm else set()
+    chk('同步 on.push 覆盖 main 与两类结果分支',
+        pb == {'main', 'cutoff-*', 'special-*'}, '配置=%s' % sorted(pb))
+    # 采集推分支到 CNB 同步完成有分钟级窗口，不加宽限会把正常窗口误判成漏同步、
+    # 卡住上线门禁（2026-11-11 实测 special-64-2025 推送 1.5 分钟后即误报）。
+    mc = read('tests/cnb_mirror_check.py')
+    chk('CNB 校验含同步窗口宽限',
+        'GRACE_MINUTES' in mc and 'grace' in mc)
+
+    # 代理池：旧版覆盖式写回把活出口越刷越少（实测刷新后 10 -> 5），
+    # 而 run_all.py 每 8 个组合就调一次，等于持续把池子刷小。
+    rp = read('refresh_pool.py')
+    chk('refresh_pool.py 合并式写回（不掉数）',
+        'before + confirmed' in rp)
+    chk('refresh_pool.py 纳入历史大池候选',
+        'proxy_pool*.txt' in rp)
+    chk('refresh_pool.py 拉云端换血后的最新池',
+        'contents/proxies_cnb.txt' in rp)
+    mm = re.search(r'MAX_SECONDS\s*=\s*(\d+)', rp)
+    chk('refresh_pool.py 硬 deadline 小于 run_all 的 150s',
+        mm is not None and 0 < int(mm.group(1)) < 150,
+        'MAX_SECONDS=%s' % (mm.group(1) if mm else '缺失'))
+    chk('supervise.sh 有代理水位自动补货',
+        'pool_refresh.lock' in read('supervise.sh'))
 
 
 def main():

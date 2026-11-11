@@ -37,5 +37,28 @@ while true; do
       fi
     fi
   fi
+  # 代理出口水位：低于 12 且距上次刷新超过 10 分钟，异步补货。
+  # refresh_pool.py 是合并式写回，只会持平或变多；锁防并发、陈旧锁自清。
+  live_n=$(wc -l < /tmp/live.txt 2>/dev/null || echo 0)
+  last=$(stat -c %Y /tmp/live.txt 2>/dev/null || echo 0)
+  age=$(( $(date +%s) - last ))
+  lock=out/pool_refresh.lock
+  if [ -f "$lock" ]; then
+    lk=$(stat -c %Y "$lock" 2>/dev/null || echo 0)
+    if [ $(( $(date +%s) - lk )) -gt 300 ]; then
+      rm -f "$lock"
+      log "代理补货锁超过 5 分钟，按陈旧锁清理"
+    fi
+  fi
+  if [ "$live_n" -lt 12 ] && [ "$age" -ge 600 ] && [ ! -f "$lock" ]; then
+    if gate; then
+      touch "$lock"
+      ( python3 -u refresh_pool.py >> out/pool_refresh.log 2>&1
+        rm -f "$lock" ) &
+      log "代理仅 $live_n 个（距上次刷新 ${age}s），异步补货 PID=$!"
+    else
+      log "代理仅 $live_n 个，但代码未通过验证，补货暂缓"
+    fi
+  fi
   sleep 60
 done

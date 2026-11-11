@@ -105,8 +105,11 @@ def main():
                               ['bash', '-n'] + shs, 60))
     steps.append(run_step('L1 离线回归（含历史 bug）',
                           [py, 'tests/regression.py'], 180))
+    # L2 是真实 GitHub API 只读契约；网络慢时单次请求可能撞 30s 超时+重试，
+    # 实测曾达 95s。step 超时给足余量，但断言仍须全部 PASS 才算过，
+    # 不把「网络慢」误杀成「代码缺陷」。
     steps.append(run_step('L2 真实 API 契约（只读）',
-                          [py, 'tests/api_contract.py'], 120))
+                          [py, 'tests/api_contract.py'], 240))
     for f in ('test_special_1090.py', 'test_special_plan_reuse.py',
               'test_special_capped.py'):
         if os.path.exists(f):
@@ -115,6 +118,8 @@ def main():
                           [py, 'tests/shadow_repo.py', '--run'], 240))
     steps.append(run_step('L4 CNB 1:1 镜像对照（集合+sha）',
                           [py, 'tests/cnb_mirror_check.py'], 300))
+    steps.append(run_step('L5 代理池补货回归（合并语义）',
+                          [py, 'tests/test_pool_refresh.py'], 180))
 
     bad = [s for s in steps if s['rc'] != 0]
     total = round(sum(s['sec'] for s in steps), 1)

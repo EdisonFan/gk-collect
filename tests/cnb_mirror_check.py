@@ -9,6 +9,8 @@
 - CNB 侧：git ls-remote --heads（凭据取沙箱 API key 通道）
 - 校验：分支集合完全一致、同名分支 sha 完全一致、main/cutoff-*/special-* 全覆盖
 
+同步窗口：采集刚推上去的分支，同步流水线有分钟级延迟。只有提交超过
+GRACE_MINUTES 仍缺失才判真漏；新分支宽限并明确打印，避免误卡上线门禁。
 凭据或网络不可用时输出 SKIP 并退出 0（不是代码缺陷，不挡上线），
 但只要拿到数据，任何差异都判 FAIL。
 用法: python3 tests/cnb_mirror_check.py
@@ -19,11 +21,13 @@ import subprocess
 import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 R = 'EdisonFan/gk-collect'
 CNB = 'cooledi/gk-collect'
+GRACE_MINUTES = 10
 FAILS = []
 
 
@@ -66,6 +70,26 @@ def gh_branches(t):
     return out
 
 
+def gh_freshness(t, names):
+    """返回 {name: 距提交分钟数}；查不到按 999 分钟（视为老分支，不宽限）。"""
+    h = {'Authorization': 'Bearer ' + t, 'User-Agent': 'cb',
+         'Accept': 'application/vnd.github+json'}
+    out, now = {}, datetime.now(timezone.utc)
+    for b in names:
+        try:
+            req = urllib.request.Request(
+                'https://api.github.com/repos/%s/commits/%s' % (R, b),
+                headers=h)
+            d = json.load(urllib.request.urlopen(req, timeout=30))
+            s = d['commit']['committer']['date']
+            dt = datetime.strptime(s, '%Y-%m-%dT%H:%M:%SZ').replace(
+                tzinfo=timezone.utc)
+            out[b] = (now - dt).total_seconds() / 60
+        except Exception:
+            out[b] = 999
+    return out
+
+
 def cnb_branches(key):
     url = 'https://cnb:%s@cnb.cool/%s.git' % (key, CNB)
     p = subprocess.run(['git', 'ls-remote', '--heads', url],
@@ -103,17 +127,28 @@ def main():
     diff = [(b, gh[b][:8], cnb[b][:8]) for b in sorted(gs & cs)
             if gh[b] != cnb[b]]
     print('  GitHub %d 个分支 / CNB %d 个分支' % (len(gs), len(cs)), flush=True)
-    chk('分支集合完全一致', not only_gh and not only_cnb,
-        '仅GitHub=%s 仅CNB=%s' % (only_gh[:5], only_cnb[:5]))
+
+    # 采集刚推的分支同步流水线还没轮到，属正常窗口；只把「超时仍缺失」判真漏。
+    fresh = gh_freshness(gh_token(), only_gh) if only_gh else {}
+    grace = [b for b in only_gh if fresh.get(b, 999) < GRACE_MINUTES]
+    stale = [b for b in only_gh if fresh.get(b, 999) >= GRACE_MINUTES]
+    if grace:
+        print('  宽限：%d 个分支刚推送、同步尚未完成 %s，不计为缺失'
+              % (len(grace),
+                 ['%s(%.1f分)' % (b, fresh[b]) for b in grace[:5]]),
+              flush=True)
+    chk('分支集合完全一致（扣除同步宽限）', not stale and not only_cnb,
+        '真漏=%s 仅CNB=%s 宽限中=%s' % (stale[:5], only_cnb[:5], grace[:5]))
     chk('同名分支 sha 全部一致', not diff,
         '不一致 %d 个 %s' % (len(diff), diff[:5]))
     for prefix, label in (('main', 'main'), ('cutoff-', '投档线 cutoff-*'),
                           ('special-', '专业线 special-*')):
         want = [b for b in gs if b == 'main'] if prefix == 'main' \
             else [b for b in gs if b.startswith(prefix)]
-        missing = [b for b in want if b not in cnb]
+        missing = [b for b in want if b not in cnb and b not in grace]
         chk('%s 在 CNB 无缺失' % label, not missing,
-            '%d 个，缺失 %s' % (len(want), missing[:5]))
+            '%d 个，缺失 %s，宽限 %d 个'
+            % (len(want), missing[:5], len([b for b in want if b in grace])))
     chk('main sha 一致', gh.get('main') == cnb.get('main'),
         '%s / %s' % (str(gh.get('main'))[:8], str(cnb.get('main'))[:8]))
 
