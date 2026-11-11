@@ -113,6 +113,8 @@ def main():
             steps.append(run_step('专项 ' + f, [py, f], 300))
     steps.append(run_step('L3 影子库端到端（真推真删）',
                           [py, 'tests/shadow_repo.py', '--run'], 240))
+    steps.append(run_step('L4 CNB 1:1 镜像对照（集合+sha）',
+                          [py, 'tests/cnb_mirror_check.py'], 300))
 
     bad = [s for s in steps if s['rc'] != 0]
     total = round(sum(s['sec'] for s in steps), 1)

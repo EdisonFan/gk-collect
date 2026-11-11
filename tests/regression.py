@@ -8,6 +8,7 @@
 """
 import io
 import os
+import re
 import sys
 import tempfile
 import urllib.error
@@ -299,6 +300,33 @@ def test_static_contracts():
         probe("pkill -f 'python3 -u run_all.py'\n"))
     chk('静态检查不被注释误伤',
         not probe("# 别用 pkill -f 'python3 -u run_all.py'\n"))
+
+    # CNB 同步契约：曾凭旧快照反复误报「漏 special-*」，实测三条 refspec 齐全。
+    # 固化成检查，防止以后改工作流时真的漏掉而无人发现。
+    sy = read('.github/workflows/sync-to-cnb.yml')
+    chk('CNB 同步含 main refspec',
+        "'+refs/remotes/origin/main:refs/heads/main'" in sy)
+    chk('CNB 同步含 cutoff-* refspec',
+        "'+refs/remotes/origin/cutoff-*:refs/heads/cutoff-*'" in sy)
+    chk('CNB 同步含 special-* refspec',
+        "'+refs/remotes/origin/special-*:refs/heads/special-*'" in sy)
+    chk('CNB 同步显式 fetch 全部远程分支',
+        "refs/heads/*:refs/remotes/origin/*" in sy)
+    chk('CNB 同步为 force+prune 镜像',
+        '--force' in sy and '--prune' in sy)
+    m = re.search(r'workflows:\s*\[([^\]]+)\]', sy)
+    listed = set(re.findall(r"'([^']+)'", m.group(1))) if m else set()
+    actual = set()
+    for f in ('collect.yml', 'collect-special.yml'):
+        mm = re.search(r'^name:\s*(\S+)',
+                       read('.github/workflows/' + f), re.M)
+        if mm:
+            actual.add(mm.group(1))
+    chk('workflow_run 名单与采集工作流 name 完全对应',
+        listed == actual and len(actual) == 2,
+        '配置=%s 实际=%s' % (sorted(listed), sorted(actual)))
+    chk('main 变更也触发同步（on.push）',
+        re.search(r'push:\s*\n\s*branches:', sy) is not None)
 
 
 def main():
