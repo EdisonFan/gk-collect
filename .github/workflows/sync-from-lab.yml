@@ -24,6 +24,20 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+  # 实测（2026-11-12）：本仓库所有 schedule 事件都未被 GitHub 下发，
+  # 不能依赖定时。改由主仓自身的高频事件驱动，纯 GitHub 侧闭环，
+  # 不再依赖会被沙箱回收的本地 lab_transport.sh 守护。
+  #  - 本地/云端用 PAT 推 special-* 结果分支 -> push
+  #  - push 触发的 CNB 镜像同步跑完 -> workflow_run
+  # 循环自限：转运推分支用 GITHUB_TOKEN（不触发 push/workflow_run），
+  # 且只在有新达标结果时显式派发一次 CNB 同步；下一轮转运发现已达标
+  # 即 SYNCED=0，不再派发，链条终止。
+  push:
+    branches:
+      - 'special-*'
+  workflow_run:
+    workflows: ["Sync gk-collect to CNB (1:1)"]
+    types: [completed]
 
 permissions:
   contents: write
