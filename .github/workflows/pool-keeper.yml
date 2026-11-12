@@ -42,6 +42,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 pool_keeper_run.py
 
+      - name: 同步代理池到 Supabase（供第三仓按需领取）
+        # 每 2 小时池换血后 upsert 进 public.proxy_pool：新出口插入、
+        # 死号复活、已剔除的旧出口标 dead。sync_proxy_pool 不覆盖在租约中的行。
+        if: always()
+        env:
+          SUPABASE_URL: https://ripobzmwgmdxyixoevee.supabase.co
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: python3 pool_sync_supabase.py
+
       - name: 触发 1:1 镜像同步
         if: steps.refresh.outputs.changed == 'true'
         env:
