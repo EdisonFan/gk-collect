@@ -68,20 +68,28 @@ jobs:
           git config user.email "gk-collect@users.noreply.github.com"
           git config user.name "gk-collect"
 
-          # 显式 fetch 新仓库全部分支（浅克隆不带其它 remote）
-          git remote add lab "https://x-access-token:${GH_TOKEN}@github.com/${LAB_REPO}.git" \
-            2>/dev/null || git remote set-url lab "https://x-access-token:${GH_TOKEN}@github.com/${LAB_REPO}.git"
-          git fetch --no-tags --depth=1 lab '+refs/heads/special-*:refs/remotes/lab/special-*'
+          # 显式 fetch 两个执行仓的结果分支（浅克隆不带其它 remote）。
+          # 第二仓 edge-cache-lab 与第三仓 edge-relay-probe 都只推自己仓，
+          # 由本工作流统一回收到主仓；谁先达标谁进，已达标不覆盖。
+          for spec in "lab:EdisonFan/edge-cache-lab" "lab2:EdisonFan/edge-relay-probe"; do
+            NAME="${spec%%:*}"
+            SRC="${spec#*:}"
+            git remote add "$NAME" "https://x-access-token:${GH_TOKEN}@github.com/${SRC}.git" 2>/dev/null \
+              || git remote set-url "$NAME" "https://x-access-token:${GH_TOKEN}@github.com/${SRC}.git"
+            git fetch --no-tags --depth=1 "$NAME" "+refs/heads/special-*:refs/remotes/${NAME}/special-*"
+          done
           echo "已拉取分支："
-          git for-each-ref --format='%(refname:short)' refs/remotes/lab/ | sed 's/^/  /'
+          git for-each-ref --format='%(refname:short)' refs/remotes/lab/ refs/remotes/lab2/ | sed 's/^/  /'
 
           SYNCED=0
           SKIPPED=0
           # 用全名 refs/remotes/lab/<branch> 避免歧义：
           # 本地分支名 special-XX 与远端引用 lab/special-XX 前缀相同，
           # git 会报 "refname is ambiguous" 并解析到错误对象。
-          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/lab/special-*); do
-            BR="${ref#refs/remotes/lab/}"
+          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/lab/special-* refs/remotes/lab2/special-*); do
+            BR="${ref##*/}"
+            SRC_NAME="${ref#refs/remotes/}"
+            SRC_NAME="${SRC_NAME%%/*}"
             F=$(git ls-tree -r --name-only "$ref" | grep -E '^out/special_[0-9]+_[0-9]+\.json$' | head -1 || true)
             if [ -z "$F" ]; then
               echo "跳过 $BR：没有结果文件"
@@ -117,7 +125,7 @@ jobs:
             mkdir -p "$(dirname "$F")"
             git show "$ref:$F" > "$F"
             git add -f "$F"
-            git commit -m "special ${BR#special-} gate_pass=True（由 ${LAB_REPO} 转运，${CNT} 条）"
+            git commit -m "special ${BR#special-} gate_pass=True（由 ${SRC_NAME} 转运，${CNT} 条）"
             git push -f origin "HEAD:refs/heads/$BR"
             echo "已转运 $BR count=$CNT"
             SYNCED=$((SYNCED+1))
