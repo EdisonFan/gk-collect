@@ -338,6 +338,17 @@ def test_static_contracts():
     mc = read('tests/cnb_mirror_check.py')
     chk('CNB 校验含同步窗口宽限',
         'GRACE_MINUTES' in mc and 'grace' in mc)
+    sw = read('.github/workflows/sync-to-cnb.yml')
+    # 云端采集器用 GITHUB_TOKEN 推分支不触发 push，workflow_run 只在整批
+    # completed 时触发；一批 10 job 常跑数小时，中间推的分支会成为同步孤儿
+    # （2026-11-12 实测 special-41-2021 缺 65 分钟，L4 抓到）。
+    # 定时兜底是第三通道，删掉就会漏镜像，故固化成静态契约。
+    chk('CNB 同步含 schedule 定时兜底',
+        'schedule:' in sw and 'cron:' in sw)
+    chk('CNB 同步 on.push 仍覆盖结果分支',
+        "'special-*'" in sw and "'cutoff-*'" in sw)
+    chk('CNB 同步仍是全量镜像（含 prune）',
+        '--prune' in sw and "refs/remotes/origin/special-*:" in sw)
 
     # 代理池：旧版覆盖式写回把活出口越刷越少（实测刷新后 10 -> 5），
     # 而 run_all.py 每 8 个组合就调一次，等于持续把池子刷小。

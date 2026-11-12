@@ -7,11 +7,14 @@
 #   1. CNB_REPO 与 GitHub repo 同名 gk-collect；组名 cooledi ≠ owner EdisonFan，须写死
 #   2. 完整镜像：main + 全部 cutoff-* / special-* 分支，--force --prune 保持逐 ref 一致
 #      —— CNB 侧不单独维护内容，GitHub 是唯一真源
-#   3. 触发双通道：云端采集器用默认 GITHUB_TOKEN 推分支，GitHub 防递归规则
-#      不会触发 workflow，故由采集 run 完成时用 workflow_run 触发；
-#      本地采集器用 PAT 推结果分支会触发 push，故 on.push 必须覆盖结果分支，
-#      否则本地推的 special-* 只停在 GitHub、进不了 CNB
-#      （2026-11-11 实测 special-64-2025 缺 15 分钟未被同步，L4 抓到）
+#   3. 触发三通道：
+#      - workflow_run：采集 run 整批 completed 时触发（覆盖云端采集器用
+#        GITHUB_TOKEN 推分支，GitHub 防递归规则不触发 push 的场景）
+#      - push：本地采集器用 PAT 推结果分支会触发，on.push 必须覆盖结果分支
+#      - schedule 定时兜底：一批 10 个 job 常跑数小时，先完成的 job 推的
+#        分支在整批 completed 之前没有 workflow_run，也不触发 push，
+#        成为同步孤儿（2026-11-12 实测 special-41-2021 因此缺 65 分钟，
+#        L4 抓到）。定时全量镜像把「批次未收口」期间的缺口也兜住。
 #   4. 显式 fetch 全部分支再推，避免 checkout 只拉当前分支导致漏推
 #   5. main 变更（归档/代码更新）与结果分支推送均由 on.push 直接触发镜像
 
@@ -23,6 +26,8 @@ on:
     types: [completed]
   push:
     branches: ['main', 'cutoff-*', 'special-*']
+  schedule:                  # 兜底：批次未收口期间推的分支也能进 CNB
+    - cron: '*/10 * * * *'
   workflow_dispatch:         # 手动补一次同步
 
 jobs:

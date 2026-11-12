@@ -111,7 +111,7 @@ def main():
     steps.append(run_step('L2 真实 API 契约（只读）',
                           [py, 'tests/api_contract.py'], 240))
     for f in ('test_special_1090.py', 'test_special_plan_reuse.py',
-              'test_special_capped.py'):
+              'test_special_capped.py', 'test_page_ckpt.py'):
         if os.path.exists(f):
             steps.append(run_step('专项 ' + f, [py, f], 300))
     steps.append(run_step('L3 影子库端到端（真推真删）',

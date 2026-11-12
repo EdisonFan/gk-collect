@@ -9,6 +9,7 @@
 """
 import os, sys, json, time, subprocess, shutil, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+import page_ckpt
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT)
@@ -19,8 +20,12 @@ H = {'Authorization':'Bearer '+TOKEN,'User-Agent':'x',
      'Accept':'application/vnd.github+json'}
 
 DONE_F, FAIL_F = 'out/done_all.json', 'out/failed_all.json'
+CLOUD_F = 'out/cloud_dispatched.json'   # 已交给 GitHub Actions 的组合，本地不再重复采
+DEFER_F = 'out/deferred.json'           # 划分口径未解、暂不参与本轮的组合
 done = json.load(open(DONE_F)) if os.path.exists(DONE_F) else []
 failed = json.load(open(FAIL_F)) if os.path.exists(FAIL_F) else []
+cloud = json.load(open(CLOUD_F)) if os.path.exists(CLOUD_F) else []
+deferred = json.load(open(DEFER_F)) if os.path.exists(DEFER_F) else []
 
 
 def save():
@@ -72,15 +77,36 @@ def main():
         log('远端达标清单拉取失败 %s，仅用本地断点' % str(e)[:60])
 
     order = {'light':0,'medium':1,'heavy':2}
-    pending = [c for c in allc if c not in set(done)]
+    # 云端已派发的组合本轮跳过：等它们推回 gate_pass=True 后，下轮 remote_ok()
+    # 会自动并入 done；若云端失败，从 CLOUD_F 删掉即可回归本地队列。
+    cloud_set, defer_set = set(cloud), set(deferred)
+    if cloud_set:
+        log('云端已派发 %d 个，本地本轮跳过：%s' % (len(cloud_set), sorted(cloud_set)))
+    if defer_set:
+        log('划分口径未解、暂缓 %d 个：%s' % (len(defer_set), sorted(defer_set)))
+    pending = [c for c in allc if c not in set(done)
+               and c not in cloud_set and c not in defer_set]
     if only: pending = [c for c in pending if c in only]
-    pending.sort(key=lambda c:(order.get(prof[c].get('tier'),3),
+    # 上一轮失败项优先重采：它们多半已留片级断点，且含「代码缺口待验证」
+    # 的组合（如 37 省需第三维切分），排最前能让修复尽快被真实数据检验。
+    failed_set = set(failed)
+    pending.sort(key=lambda c:(0 if c in failed_set else 1,
+                               order.get(prof[c].get('tier'),3),
                                prof[c].get('est_minutes',0), c))
     if limit: pending = pending[:limit]
     log('本轮待采 %d 组合，按 轻→中→重 排序，前10: %s' % (len(pending), pending[:10]))
 
     t_all = time.time(); n_ok = 0; n_fail = 0
     for i, c in enumerate(pending, 1):
+        # 云端续派守护可能在此期间派了新组合：每个组合开始前重读台账，
+        # 已交给云端的就让路，避免两边重复采同一个。台账只在启动时读一次不够。
+        if os.path.exists(CLOUD_F):
+            try:
+                if c in json.load(open(CLOUD_F)):
+                    log('--- [%d/%d] %s 云端已接手，本地跳过 ---' % (i, len(pending), c))
+                    continue
+            except Exception:
+                pass
         p, y = c.split('-')
         F = 'out/special_%s_%s.json' % (p, y)
         log('--- [%d/%d] %s 开始 ---' % (i, len(pending), c))
@@ -94,13 +120,18 @@ def main():
                     need_collect = False
             except Exception: pass
         if need_collect:
+            # 超时按预估页量给，不再固定 3000s：1800 页级重档实测需要
+            # 3600~4700s，固定值会在采到 1600/1838 页时误杀且页结果全丢。
+            tmo = page_ckpt.timeout_for(prof.get(c, {}).get('est_pages', 0))
             try:
                 r = subprocess.run([sys.executable,'-u','local_any.py',p,y],
                                    stdout=open('out/run_%s_%s.log'%(p,y),'w'),
-                                   stderr=subprocess.STDOUT, timeout=3000)
+                                   stderr=subprocess.STDOUT, timeout=tmo)
                 if r.returncode != 0: log('  采集脚本退出码 %d' % r.returncode)
             except subprocess.TimeoutExpired:
-                log('  采集超时 3000s，标记失败'); failed.append(c); save(); n_fail += 1; continue
+                # 页级断点已增量落盘，下次重跑只补缺页，不再从头白跑。
+                log('  采集超时 %ds，标记失败（页级断点已保留）' % tmo)
+                failed.append(c); save(); n_fail += 1; continue
         gp = False
         try: gp = json.load(open(F,encoding='utf-8')).get('gate_pass') is True
         except Exception as e: log('  结果文件异常 %s' % str(e)[:60])

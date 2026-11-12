@@ -20,6 +20,7 @@
 """
 import os, json, time, sys, threading, hashlib, requests
 from concurrent.futures import ThreadPoolExecutor
+import page_ckpt
 
 PROV, YEAR = sys.argv[1], int(sys.argv[2])
 U = 'https://api.zjzw.cn/web/api/'
@@ -32,6 +33,7 @@ SIZE_LADDER = [20, 10, 5, 2]
 SIZE, LEAF_MAX, NUMFOUND_CAP, MAX_PAGES = 20, 4000, 10000, 600
 PARTS = 'out/parts_%s_%s' % (PROV, YEAR)
 OUT = 'out/special_%s_%s.json' % (PROV, YEAR)
+CKPT = 'out/page_ckpt_%s_%s.json' % (PROV, YEAR)
 os.makedirs(PARTS, exist_ok=True)
 
 PIDS = ['11','12','13','14','15','21','22','23','31','32','33','34','35','36',
@@ -135,8 +137,16 @@ def leaf_pages(extra, label, nf, size):
 def log(*a): print('[%s]' % time.strftime('%H:%M:%S'), *a, flush=True)
 
 
-def build(e0, l0, first, second, fv, sv, tag):
-    """对单个超限片做一套划分；叶子为 (extra, label, nf, size)。"""
+THIRD_DIM = 'level2_name'   # 专业大类，用于两维切完仍超 4000 的组合片再切一层
+
+
+def build(e0, l0, first, second, fv, sv, tag, tv3):
+    """对单个超限片做一套划分；叶子为 (extra, label, nf, size)。
+
+    tv3 = (第三维字段名, 值全集)。组合片经两维切分后仍 >=LEAF_MAX 时，
+    按第三维再切一层，并要求子片 Σ 严格等于父片 numFound，否则判不完备。
+    实测服务端 page>200 后不再返回数据，4000 条是硬上限，只能切不能硬翻。
+    """
     leaves, lvl1 = [], []
     def probe_retry(extra):
         for _ in range(3):
@@ -176,9 +186,31 @@ def build(e0, l0, first, second, fv, sv, tag):
                                '%s|%s|%s=%s+%s=%s'%(l0,tag,first,v,second,w),
                                n2, s2))
             elif n2 >= LEAF_MAX:
-                log('  组合片仍>=%d (%s=%s+%s=%s nf=%d)，需第三维，判不完备'
-                    %(LEAF_MAX,first,v,second,w,n2))
-                return None
+                dim3, vv3 = tv3
+                def p3(u):
+                    n3, s3 = probe_retry(dict(e1, **{second:w, dim3:u}))
+                    return u, n3, s3
+                with ThreadPoolExecutor(10) as ex:
+                    r3 = list(ex.map(p3, sorted(vv3)))
+                miss3 = [u for u,n3,s3 in r3 if n3 is None]
+                if miss3:
+                    log('  %s 第三维探测失败值 %s，判不完备' % (tag, miss3))
+                    return None
+                too_big = [(u,n3) for u,n3,s3 in r3 if n3 >= LEAF_MAX]
+                if too_big:
+                    log('  %s 第三维子片仍>=%d %s，判不完备'
+                        % (tag, LEAF_MAX, too_big[:4])); return None
+                subs = [(dict(e1, **{second:w, dim3:u}),
+                         '%s|%s|%s=%s+%s=%s+%s=%s'
+                         % (l0,tag,first,v,second,w,dim3,u), n3, s3)
+                        for u,n3,s3 in r3 if n3 > 0]
+                s3sum = sum(n3 for u,n3,s3 in r3)
+                if s3sum != n2:
+                    log('  %s 第三维子片Σ=%d != 父片nf=%d，疑漏值，判不完备'
+                        % (tag, s3sum, n2)); return None
+                log('  %s 组合片 nf=%d -> 第三维 %s 切出 %d 子片 Σ=%d（守恒）'
+                    % (tag, n2, dim3, len(subs), s3sum))
+                leaves += subs
     return leaves
 
 
@@ -223,7 +255,7 @@ def main():
                [(l,n) for e,l,n,sz in over]))
         method = 'province34+dual'
         for e0, l0, n0, _sz in over:
-            tv, bv = set(CAND_T), set(CAND_B)
+            tv, bv, uv = set(CAND_T), set(CAND_B), set()
             def disc(p): return fetch(e0, p, 10)
             with ThreadPoolExecutor(10) as ex:
                 for d,c in ex.map(disc, range(1,201)):
@@ -231,9 +263,12 @@ def main():
                     for x in (d.get('item') or []):
                         if x.get('local_type_name'): tv.add(x['local_type_name'])
                         if x.get('local_batch_name'): bv.add(x['local_batch_name'])
-            log('  %s 维度全集 科类%d 批次%d' % (l0, len(tv), len(bv)))
-            A = build(e0, l0, 'local_type_name', 'local_batch_name', tv, bv, 'A')
-            B = build(e0, l0, 'local_batch_name', 'local_type_name', bv, tv, 'B')
+                        if x.get(THIRD_DIM): uv.add(x[THIRD_DIM])
+            log('  %s 维度全集 科类%d 批次%d %s %d'
+                % (l0, len(tv), len(bv), THIRD_DIM, len(uv)))
+            tv3 = (THIRD_DIM, uv)
+            A = build(e0, l0, 'local_type_name', 'local_batch_name', tv, bv, 'A', tv3)
+            B = build(e0, l0, 'local_batch_name', 'local_type_name', bv, tv, 'B', tv3)
             if A is None or B is None:
                 log('  %s 划分未收敛，终止' % l0); return
             sa, sb = sum(x[2] for x in A), sum(x[2] for x in B)
@@ -265,7 +300,14 @@ def main():
     for e,l,n,sz in todo: tasks += leaf_pages(e,l,n,sz)
     log('页任务 %d 个，全局并发 12' % len(tasks))
 
-    bucket = {}
+    # 页级增量断点：进程被上层环境释放 / 超时被杀时，已采页不丢，
+    # 重跑 page_ckpt.pending() 只补缺页，不再「断点命中 0」从头再来。
+    bucket = page_ckpt.load(CKPT)
+    hit = sum(len(v) for v in bucket.values())
+    all_tasks = list(tasks)
+    tasks = page_ckpt.pending(tasks, bucket)
+    if hit:
+        log('页级断点命中 %d 页，本次仅补采 %d / %d' % (hit, len(tasks), len(all_tasks)))
     def run(t):
         l,e,p,sz = t
         d,c = fetch(e,p,sz)
@@ -275,7 +317,10 @@ def main():
         for l,p,it,c in ex.map(run, tasks):
             bucket.setdefault(l, {})[p] = (it,c)
             cnt += 1
-            if cnt % 400 == 0: log('  页进度 %d/%d' % (cnt,len(tasks)))
+            if cnt % 200 == 0:
+                page_ckpt.save(CKPT, bucket)
+                log('  页进度 %d/%d（已增量落盘）' % (hit+cnt, hit+len(tasks)))
+    page_ckpt.save(CKPT, bucket)   # 收尾：不足 200 页的零头也落盘
 
     def persist(e, l, n, pages, retry=False):
         items, oversize, badpages = [], False, 0
@@ -321,12 +366,18 @@ def main():
         for e,l,n,sz in fail:
             fp = ppath(l)
             if os.path.exists(fp): os.remove(fp)
+        # 失败片的页级断点一并作废：否则下次重跑命中旧页，
+        # persist 又失败，形成「永远重采不干净」的死循环。
+        bad = set(l for _,l,_,_ in fail)
+        page_ckpt.save(CKPT, {k:v for k,v in bucket.items() if k not in bad})
         tasks2 = []
         for e,l,n,sz in fail: tasks2 += leaf_pages(e,l,n,sz)
         bucket2 = {}
         with ThreadPoolExecutor(10) as ex:
             for l,p,it,c in ex.map(run, tasks2):
                 bucket2.setdefault(l,{})[p] = (it,c)
+        merged = dict(bucket); merged.update(bucket2)
+        page_ckpt.save(CKPT, merged)   # 重采结果也增量落盘
         still = []
         for e,l,n,sz in fail:
             if not persist(e, l, n, bucket2.get(l, {}), retry=True):
@@ -408,6 +459,10 @@ def main():
     if not gate_pass:
         log('!!! gate_pass=False，写出结果但标记失败，不推送')
     json.dump(out, open(OUT,'w',encoding='utf-8'), ensure_ascii=False)
+    if gate_pass:
+        # 四闸门全过，结果已落盘：清掉页级断点，避免下轮误命中旧页。
+        try: os.remove(CKPT)
+        except OSError: pass
     log('=== 完成 -> %s (%d字节) gate_pass=%s 耗时%.1fs ==='
         %(OUT, os.path.getsize(OUT), gate_pass, time.time()-t0))
 
