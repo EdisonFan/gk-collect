@@ -44,6 +44,10 @@ jobs:
       - name: 从 edge-cache-lab 拉取结果分支并推回主仓库
         env:
           LAB_REPO: EdisonFan/edge-cache-lab
+          # gh CLI 只认 GH_TOKEN；只给 GITHUB_TOKEN 时 gh workflow run 会静默失败
+          # （2026-11-12 实测：日志「触发镜像同步失败」，但转运本身成功）。
+          # 注意：不要在这里显式设 GITHUB_TOKEN，Actions 已自动注入该变量，
+          # 手写覆盖反而可能让它失效。
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
@@ -107,9 +111,21 @@ jobs:
           done
           echo "转运完成：$SYNCED 个，跳过 $SKIPPED 个"
 
-          # 转运会推分支，触发 on.push 同步到 CNB；GITHUB_TOKEN 推分支不触发
-          # workflow_run，所以这里显式补一次镜像同步
+          # 转运会推分支，但 GITHUB_TOKEN 推的分支不触发 workflow_run，
+          # 也因 GitHub 防递归规则不触发 on.push，所以这里显式补一次镜像同步。
+          # 注意 gh CLI 读的是 GH_TOKEN，只给 GITHUB_TOKEN 会静默失败
+          # （2026-11-12 实测：日志显示「触发镜像同步失败」）。
           if [ "$SYNCED" -gt 0 ]; then
-            gh workflow run sync-to-cnb.yml --repo "$GITHUB_REPOSITORY" --ref main \
-              && echo "已触发 sync-to-cnb 镜像同步" || echo "触发镜像同步失败（不影响本次转运）"
+            if gh workflow run sync-to-cnb.yml --repo "$GITHUB_REPOSITORY" --ref main; then
+              echo "已触发 sync-to-cnb 镜像同步"
+            else
+              echo "触发镜像同步失败，改用 API 直接派发"
+              curl -sS --max-time 40 -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                -d '{"ref":"main"}' \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sync-to-cnb.yml/dispatches" \
+                && echo "API 派发镜像同步成功" || echo "API 派发也失败（不影响本次转运，下轮定时会补）"
+            fi
           fi
