@@ -84,14 +84,22 @@ jobs:
               SKIPPED=$((SKIPPED+1))
               continue
             fi
-            # 从新仓库分支内容建一个新提交推到主仓库同名分支
-            git checkout -B "$BR" "$ref"
+            # 只取结果文件本身，不 checkout 新仓库整棵树。
+            # 之前 checkout -B "$BR" "$ref" 会把新仓库的文件树带进主仓库分支
+            # （删除 main 独有文件），且浅克隆缺对象导致
+            # "remote unpack failed: index-pack failed"。
+            # 改为：从 main 起一个干净分支，只 add 结果文件。
+            git checkout -B "$BR" main
             git rm -r --cached . >/dev/null 2>&1 || true
+            git checkout main -- . 2>/dev/null || true
+            git reset >/dev/null
+            git show "$ref:$F" > "$F"
             git add -f "$F"
             git commit -m "special ${BR#special-} gate_pass=True（由 ${LAB_REPO} 转运，${CNT} 条）"
             git push -f origin "HEAD:refs/heads/$BR"
             echo "已转运 $BR count=$CNT"
             SYNCED=$((SYNCED+1))
+            git checkout main
           done
           echo "转运完成：$SYNCED 个，跳过 $SKIPPED 个"
 
