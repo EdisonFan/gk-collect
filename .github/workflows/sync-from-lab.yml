@@ -76,7 +76,10 @@ jobs:
             SRC="${spec#*:}"
             git remote add "$NAME" "https://x-access-token:${GH_TOKEN}@github.com/${SRC}.git" 2>/dev/null \
               || git remote set-url "$NAME" "https://x-access-token:${GH_TOKEN}@github.com/${SRC}.git"
-            git fetch --no-tags --depth=1 "$NAME" "+refs/heads/special-*:refs/remotes/${NAME}/special-*"
+            # 某个执行仓还没产出 special-* 分支时 fetch 会返回 1，
+            # 这不是错误：不该让整趟转运失败（2026-11-12 实测踩过）。
+            git fetch --no-tags --depth=1 "$NAME" "+refs/heads/special-*:refs/remotes/${NAME}/special-*" \
+              || echo "  $NAME 暂无 special-* 结果分支，跳过本源"
           done
           echo "已拉取分支："
           git for-each-ref --format='%(refname:short)' refs/remotes/lab/ refs/remotes/lab2/ | sed 's/^/  /'
