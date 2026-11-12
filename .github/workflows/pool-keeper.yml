@@ -1,4 +1,6 @@
-# GitHub Actions runner 上的代理池维护：每 2 小时探活 + 剔除失效 + 补充换血。
+# GitHub Actions runner 上的代理池维护：每 30 分钟探活 + 剔除失效 + 补充换血。
+# 2026-11-12：由每 2 小时改为每 30 分钟。第三采集通道改为「领一个长期持有、
+# 坏了才换」，池的新鲜度直接决定换到手的号质量，所以缩短换血周期。
 #
 # 为什么不在平行世界定时任务里做（重要）：
 #   sandbox_agent 容器无法连通任意免费代理 IP，14:14 建任务以来每轮探活
@@ -9,14 +11,14 @@
 #   就等于用 GitHub 共享出口 IP 打 api.zjzw.cn，正是要避免的事。本工作流
 #   全程只经代理访问目标站，脚本内 _probe 对空 proxy 有硬性断言。
 #
-# 配额：单轮约 2~3 分钟，每 2 小时 = 12 轮/天，约 900~1100 分钟/月
-#       （私有仓免费额度 2000 分钟/月）。池无变化时不写回、也不触发镜像。
+# 配额：单轮约 2~3 分钟，每 30 分钟 = 48 轮/天。公开仓 Actions 免费额度
+#       充足；单轮仍设 7 分钟超时防止失控。池无变化时不写回、也不触发镜像。
 
 name: Pool keeper (proxy refresh on runner)
 
 on:
   schedule:
-    - cron: '0 */2 * * *'      # UTC 偶数小时整点；私有仓 schedule 正常生效
+    - cron: '*/30 * * * *'     # 每 30 分钟：:00 与 :30 各一次
   workflow_dispatch:            # 手动补一轮 / 派发大批量前预热池子
 
 permissions:
@@ -43,7 +45,7 @@ jobs:
         run: python3 pool_keeper_run.py
 
       - name: 同步代理池到 Supabase（供第三仓按需领取）
-        # 每 2 小时池换血后 upsert 进 public.proxy_pool：新出口插入、
+        # 每 30 分钟池换血后 upsert 进 public.proxy_pool：新出口插入、
         # 死号复活、已剔除的旧出口标 dead。sync_proxy_pool 不覆盖在租约中的行。
         if: always()
         env:
