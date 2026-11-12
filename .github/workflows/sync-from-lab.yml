@@ -59,7 +59,10 @@ jobs:
 
           SYNCED=0
           SKIPPED=0
-          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/lab/special-*); do
+          # 用全名 refs/remotes/lab/<branch> 避免歧义：
+          # 本地分支名 special-XX 与远端引用 lab/special-XX 前缀相同，
+          # git 会报 "refname is ambiguous" 并解析到错误对象。
+          for ref in $(git for-each-ref --format='%(refname)' refs/remotes/lab/special-*); do
             BR="${ref#refs/remotes/lab/}"
             F=$(git ls-tree -r --name-only "$ref" | grep -E '^out/special_[0-9]+_[0-9]+\.json$' | head -1 || true)
             if [ -z "$F" ]; then
