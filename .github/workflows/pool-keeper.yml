@@ -20,6 +20,12 @@ on:
   schedule:
     - cron: '*/30 * * * *'     # 每 30 分钟：:00 与 :30 各一次
   workflow_dispatch:            # 手动补一轮 / 派发大批量前预热池子
+  # 兜底（2026-11-12 实测）：本仓库高频 schedule（*/10）从未被 GitHub 下发，
+  # 改 */30 后 30 分钟也未见 schedule 记录。结果分支推送会带起本工作流，
+  # 由下方冷却检查限制为最多每 30 分钟一次，保证「半小时换血」真正落地。
+  push:
+    branches:
+      - 'special-*'
 
 permissions:
   contents: write               # 写 proxies_cnb.txt
@@ -38,7 +44,25 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: 冷却检查（schedule 未下发时兜底，但不过频）
+        id: cooldown
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LAST=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=pool-keeper.yml \
+            --status success --limit 1 --json createdAt -q '.[0].createdAt' 2>/dev/null || true)
+          if [ -n "$LAST" ] && [ "$LAST" != "null" ]; then
+            AGE=$(( $(date +%s) - $(date -u -d "$LAST" +%s) ))
+            if [ "$AGE" -lt 1500 ]; then
+              echo "距上次成功刷新 ${AGE}s < 1500s，跳过本轮"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: 探活并补充代理池（全程零直连）
+        if: steps.cooldown.outputs.skip != 'true'
         id: refresh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -47,14 +71,14 @@ jobs:
       - name: 同步代理池到 Supabase（供第三仓按需领取）
         # 每 30 分钟池换血后 upsert 进 public.proxy_pool：新出口插入、
         # 死号复活、已剔除的旧出口标 dead。sync_proxy_pool 不覆盖在租约中的行。
-        if: always()
+        if: steps.cooldown.outputs.skip != 'true' && always()
         env:
           SUPABASE_URL: https://ripobzmwgmdxyixoevee.supabase.co
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: python3 pool_sync_supabase.py
 
       - name: 触发 1:1 镜像同步
-        if: steps.refresh.outputs.changed == 'true'
+        if: steps.cooldown.outputs.skip != 'true' && steps.refresh.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
