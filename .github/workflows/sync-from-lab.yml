@@ -1,0 +1,103 @@
+# 从新仓库 edge-cache-lab 回收专业录取线结果到主仓库（1:1 转运）。
+#
+# 为什么要单独一个工作流（2026-11-12 实测）：
+#   新仓库只负责「执行」，但全局达标统计、CNB 镜像、cloud_feed 的 gate_ok
+#   全部基于主仓库的 special-* 分支。结果不回主仓库，这批组合永远显示未达标。
+#
+# 为什么不让沙箱本地搬运（实测走不通）：
+#   结果文件 20~30MB。沙箱出口对单次大响应会截断：
+#     - GitHub blob API 整块 GET 每次在 7~17MB 处 IncompleteRead，重试 3 次同样断；
+#     - GitHub blob 端点忽略 Range 头（返回 422），无法分块；
+#     - raw.githubusercontent 与 git fetch 同样被截断/连不上 443。
+#   但 GitHub Actions runner 网络通畅且稳定，所以把「搬运」这件事交给 runner。
+#
+# 搬运方式：runner 上 git fetch 新仓库的 special-* 分支，再推到主仓库同名分支。
+#   - 保留新仓库结果文件原样（不重新序列化，避免内容漂移）
+#   - commit 首行带 gate_pass=True，让 cloud_feed.gate_ok 能认
+#   - 主仓库已有 gate_pass=True 的结果时跳过，避免用未达标结果覆盖已达标结果
+#
+# 触发：schedule 每 10 分钟 + workflow_dispatch（手动补一轮）
+
+name: Sync lab results back to gk-collect
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gk-lab-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 从 edge-cache-lab 拉取结果分支并推回主仓库
+        env:
+          LAB_REPO: EdisonFan/edge-cache-lab
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.email "gk-collect@users.noreply.github.com"
+          git config user.name "gk-collect"
+
+          # 显式 fetch 新仓库全部分支（浅克隆不带其它 remote）
+          git remote add lab "https://x-access-token:${GH_TOKEN}@github.com/${LAB_REPO}.git" \
+            2>/dev/null || git remote set-url lab "https://x-access-token:${GH_TOKEN}@github.com/${LAB_REPO}.git"
+          git fetch --no-tags --depth=1 lab '+refs/heads/special-*:refs/remotes/lab/special-*'
+          echo "已拉取分支："
+          git for-each-ref --format='%(refname:short)' refs/remotes/lab/ | sed 's/^/  /'
+
+          SYNCED=0
+          SKIPPED=0
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/lab/special-*); do
+            BR="${ref#refs/remotes/lab/}"
+            F=$(git ls-tree -r --name-only "$ref" | grep -E '^out/special_[0-9]+_[0-9]+\.json$' | head -1 || true)
+            if [ -z "$F" ]; then
+              echo "跳过 $BR：没有结果文件"
+              continue
+            fi
+            # 主仓库已有 gate_pass=True 的结果就不覆盖（防止降级）
+            if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
+              OLD=$(git log -1 --format='%s' "$BR" || true)
+              case "$OLD" in
+                *gate_pass=True*)
+                  echo "跳过 $BR：主仓库已有达标结果"
+                  SKIPPED=$((SKIPPED+1))
+                  continue
+                  ;;
+              esac
+            fi
+            CNT=$(git show "$ref:$F" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('count',0))" 2>/dev/null || echo 0)
+            GP=$(git show "$ref:$F" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('gate_pass',False))" 2>/dev/null || echo False)
+            if [ "$GP" != "True" ]; then
+              echo "跳过 $BR：gate_pass 非 True（$GP）"
+              SKIPPED=$((SKIPPED+1))
+              continue
+            fi
+            # 从新仓库分支内容建一个新提交推到主仓库同名分支
+            git checkout -B "$BR" "$ref"
+            git rm -r --cached . >/dev/null 2>&1 || true
+            git add -f "$F"
+            git commit -m "special ${BR#special-} gate_pass=True（由 ${LAB_REPO} 转运，${CNT} 条）"
+            git push -f origin "HEAD:refs/heads/$BR"
+            echo "已转运 $BR count=$CNT"
+            SYNCED=$((SYNCED+1))
+          done
+          echo "转运完成：$SYNCED 个，跳过 $SKIPPED 个"
+
+          # 转运会推分支，触发 on.push 同步到 CNB；GITHUB_TOKEN 推分支不触发
+          # workflow_run，所以这里显式补一次镜像同步
+          if [ "$SYNCED" -gt 0 ]; then
+            gh workflow run sync-to-cnb.yml --repo "$GITHUB_REPOSITORY" --ref main \
+              && echo "已触发 sync-to-cnb 镜像同步" || echo "触发镜像同步失败（不影响本次转运）"
+          fi
