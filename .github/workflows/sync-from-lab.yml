@@ -93,6 +93,7 @@ jobs:
             git rm -r --cached . >/dev/null 2>&1 || true
             git checkout main -- . 2>/dev/null || true
             git reset >/dev/null
+            mkdir -p "$(dirname "$F")"
             git show "$ref:$F" > "$F"
             git add -f "$F"
             git commit -m "special ${BR#special-} gate_pass=True（由 ${LAB_REPO} 转运，${CNT} 条）"
