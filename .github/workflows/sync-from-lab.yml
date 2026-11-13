@@ -41,6 +41,7 @@ on:
 
 permissions:
   contents: write
+  actions: write        # gh workflow run / dispatches 需要；缺了会 403（11-13 实测）
 
 concurrency:
   group: gk-lab-sync
@@ -98,17 +99,23 @@ jobs:
               echo "跳过 $BR：没有结果文件"
               continue
             fi
-            # 主仓库已有 gate_pass=True 的结果就不覆盖（防止降级）
-            if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
-              OLD=$(git log -1 --format='%s' "$BR" || true)
-              case "$OLD" in
-                *gate_pass=True*)
-                  echo "跳过 $BR：主仓库已有达标结果"
-                  SKIPPED=$((SKIPPED+1))
-                  continue
-                  ;;
-              esac
-            fi
+            # 主仓库已有 gate_pass=True 的结果就不覆盖（防止降级）。
+            # 2026-11-13 修：runner 上 checkout 只拉 main，refs/heads/$BR
+            # 根本不存在，旧写法 git rev-parse 恒判 false，导致 14:15
+            # 把 10 个已达标分支重复转运了一遍。改为查远程分支的
+            # commit message（一次轻量 API，不下载 40MB 结果文件）。
+            OLD=$(curl -sS --max-time 30 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/${BR}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); m=(d.get('commit',{}).get('commit',{}).get('message') or '').splitlines(); print(m[0] if m else '')" 2>/dev/null || echo '')
+            case "$OLD" in
+              *gate_pass=True*)
+                echo "跳过 $BR：主仓库已有达标结果"
+                SKIPPED=$((SKIPPED+1))
+                continue
+                ;;
+            esac
             CNT=$(git show "$ref:$F" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('count',0))" 2>/dev/null || echo 0)
             GP=$(git show "$ref:$F" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('gate_pass',False))" 2>/dev/null || echo False)
             if [ "$GP" != "True" ]; then
@@ -140,17 +147,30 @@ jobs:
           # 也因 GitHub 防递归规则不触发 on.push，所以这里显式补一次镜像同步。
           # 注意 gh CLI 读的是 GH_TOKEN，只给 GITHUB_TOKEN 会静默失败
           # （2026-11-12 实测：日志显示「触发镜像同步失败」）。
+          # 2026-11-13 修：GITHUB_TOKEN 缺 actions: write 时 gh/API 都返回
+          # 403 "Resource not accessible by integration"；旧兜底 curl 没加 -f，
+          # 403 也被当成成功打印「API 派发镜像同步成功」，实际没产生 run。
+          # 现在按 HTTP 状态码判定，失败用 ::error:: 明确报出。
           if [ "$SYNCED" -gt 0 ]; then
+            TRIGGERED=0
             if gh workflow run sync-to-cnb.yml --repo "$GITHUB_REPOSITORY" --ref main; then
-              echo "已触发 sync-to-cnb 镜像同步"
+              echo "已触发 sync-to-cnb 镜像同步（gh）"
+              TRIGGERED=1
             else
-              echo "触发镜像同步失败，改用 API 直接派发"
-              curl -sS --max-time 40 -X POST \
+              echo "::warning::gh 触发失败，改用 API 直接派发"
+              CODE=$(curl -sS --max-time 40 -o /tmp/dispatch_resp.json \
+                -w '%{http_code}' -X POST \
                 -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 -H "Content-Type: application/json" \
                 -d '{"ref":"main"}' \
-                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sync-to-cnb.yml/dispatches" \
-                && echo "API 派发镜像同步成功" || echo "API 派发也失败（不影响本次转运，下轮定时会补）"
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/sync-to-cnb.yml/dispatches" || echo 000)
+              if [ "$CODE" = "204" ] || [ "$CODE" = "200" ]; then
+                echo "API 派发镜像同步成功 HTTP $CODE"
+                TRIGGERED=1
+              else
+                echo "::error::API 派发镜像同步失败 HTTP $CODE: $(head -c 300 /tmp/dispatch_resp.json 2>/dev/null)"
+              fi
             fi
+            [ "$TRIGGERED" = "1" ] || echo "::error::本轮转运未触发镜像同步，CNB 可能滞后，需手动补一轮"
           fi
