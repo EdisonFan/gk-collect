@@ -38,14 +38,19 @@ HDR = {
     'Accept': 'application/json,text/plain,*/*',
     'Content-Type': 'application/json',
 }
-PROBE_URI = 'apidata/api/gk/score/province'
+# 探活与真实采集同接口：score/special。原用 score/province，通率虚高
+# ——免费号能打通 province 未必能打通 special，入池后马上被采集器判死。
+# 变体里的 school_id 均实测有数据（numFound 16~40），size=1 使 item 非空
+# 满足 _probe 的 OK 判定，同时响应体最小，彻底避开 1090
+# 「数据长度超过 30000 字符」（43-2024 sid=46 即栽在此）。
+PROBE_URI = 'apidata/api/gk/score/special'
 PROBE_VARIANTS = [
-    {'local_province_id': '41', 'year': 2025, 'province_id': '11'},
-    {'local_province_id': '11', 'year': 2026, 'province_id': '41'},
-    {'local_province_id': '51', 'year': 2025, 'province_id': '65'},
-    {'local_province_id': '65', 'year': 2026, 'province_id': '51'},
-    {'local_province_id': '37', 'year': 2024, 'province_id': '13'},
-    {'local_province_id': '42', 'year': 2026, 'province_id': '11'},
+    {'local_province_id': '43', 'year': 2024, 'school_id': 45},
+    {'local_province_id': '36', 'year': 2024, 'school_id': 46},
+    {'local_province_id': '37', 'year': 2024, 'school_id': 46},
+    {'local_province_id': '51', 'year': 2025, 'school_id': 45},
+    {'local_province_id': '11', 'year': 2026, 'school_id': 45},
+    {'local_province_id': '41', 'year': 2025, 'school_id': 45},
 ]
 SOURCES = [
     ('TheSpeedX', 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'),
@@ -121,7 +126,10 @@ def write_pool(token, lines, sha):
 
 
 def _body(variant, page=1):
-    d = {'uri': PROBE_URI, 'page': page, 'size': 20}
+    # size=1：score/special 单条记录也可能极长，size=20 会触发 1090
+    # （响应体 >30000 字符）；size=1 响应最小且 item 非空，正好满足
+    # _probe 的 OK 判定。变体 school_id 均已实测有数据。
+    d = {'uri': PROBE_URI, 'page': page, 'size': 1}
     d.update(variant)
     return json.dumps(d).encode()
 
