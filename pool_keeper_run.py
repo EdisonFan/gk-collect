@@ -56,7 +56,7 @@ SOURCES = [
     ('TheSpeedX', 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'),
     ('clarketm', 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt'),
     ('proxifly', 'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt'),
-    ('geonode', 'https://proxylist.geonode.com/api/proxy-list?limit=1000&page=1&sort_by=lastChecked&sort_type=desc'),
+    ('geonode', 'https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc'),
 ]
 OWNER, REPO = 'EdisonFan', 'gk-collect'
 API_CONTENT = 'https://api.github.com/repos/%s/%s/contents/proxies_cnb.txt' % (OWNER, REPO)
