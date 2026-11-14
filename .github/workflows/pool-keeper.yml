@@ -68,6 +68,8 @@ jobs:
         id: refresh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUPABASE_URL: https://ripobzmwgmdxyixoevee.supabase.co
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: python3 pool_keeper_run.py
 
       - name: 同步代理池到 Supabase（供第三仓按需领取）
