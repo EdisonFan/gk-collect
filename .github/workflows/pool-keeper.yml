@@ -24,6 +24,15 @@ name: Pool keeper (proxy refresh on runner)
 
 on:
   workflow_dispatch:            # 主触发源：平台定时任务每 30 分钟发一次；也可手动预热
+    inputs:
+      force:
+        description: '跳过冷却检查，强制刷新一次（手动预热 / 验证改动用）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
   # 兜底：结果分支推送也带起本工作流，由下方冷却检查限制为最多每 30 分钟一次。
   push:
     branches:
@@ -51,6 +60,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "force=true：跳过冷却检查，强制刷新"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           LAST=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=pool-keeper.yml \
             --status success --limit 1 --json createdAt -q '.[0].createdAt' 2>/dev/null || true)
           if [ -n "$LAST" ] && [ "$LAST" != "null" ]; then
