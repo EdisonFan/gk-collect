@@ -1,0 +1,107 @@
+name: gk-special-school
+run-name: "云端 school_id 采集 ${{ inputs.combo }}"
+
+# 触发红线（2026-11-14 用户明确）：本工作流绝不写 schedule: / cron。
+# GitHub 定时实际下发时间由 GitHub 自己的空闲度决定（设 5 分钟可能 5 小时
+# 才跑），采集发起权保留在 WorkBuddy 定时任务 / 本地派发器，只通过
+# workflow_dispatch 派发；本仓库只负责在 runner 上执行，不会被沙箱回收。
+#
+# 与既有 gk-special（G2 完备切分）隔离：
+#   * 独立工作流名（不叫 bench，避免触发 notify.yml -> sync-from-lab 空转）
+#   * 独立分片维度 school_id（2970 校全集，确定性完备划分，Σ 守恒）
+#   * 结果仍推 special-<combo> 分支，主仓归档口径不变
+#   * 代理走 Supabase claim_proxy/release_proxy 租约池，与本地同源
+
+on:
+  workflow_dispatch:
+    inputs:
+      combo:
+        description: '单个组合 prov-year，如 37-2021'
+        required: true
+        type: string
+      tag:
+        description: '批次标签'
+        required: false
+        type: string
+        default: 'school-cloud'
+      chain:
+        description: '后续组合队列（逗号分隔）。本组合达标入库后由 merge 自动派发下一个，实现云端串行自驱，无需任何定时触发'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: gk-school-${{ inputs.combo }}
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      # 免费代理池稳态有限；实测 4 并发会打穿探测请求，3 并发与本地 WORKERS=3 对齐
+      max-parallel: 3
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 采集分片 ${{ matrix.shard }}/20
+        timeout-minutes: 130
+        env:
+          COMBO: ${{ inputs.combo }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: '20'
+          WORKERS: '3'
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -e
+          python3 -m pip install --quiet requests
+          mkdir -p out
+          python3 cloud_school_shard.py
+
+      - name: 上传分片结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: school-${{ inputs.combo }}-s${{ matrix.shard }}
+          path: out/school_*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  merge:
+    needs: collect
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: school-${{ inputs.combo }}-s*
+          merge-multiple: true
+          path: out
+
+      - name: 汇总验收 + 推结果分支
+        env:
+          COMBO: ${{ inputs.combo }}
+          CHAIN: ${{ inputs.chain }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 cloud_school_merge.py
+
+      # GITHUB_TOKEN 推的分支不触发 on.push，显式补一次 1:1 镜像
+      - name: 触发 CNB 1:1 镜像
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run sync-to-cnb.yml --repo "$GITHUB_REPOSITORY" --ref main || true
