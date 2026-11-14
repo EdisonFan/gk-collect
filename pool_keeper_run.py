@@ -55,6 +55,7 @@ SOURCES = [
 ]
 OWNER, REPO = 'EdisonFan', 'gk-collect'
 API_CONTENT = 'https://api.github.com/repos/%s/%s/contents/proxies_cnb.txt' % (OWNER, REPO)
+SB_BASE = os.environ.get('SUPABASE_URL', 'https://ripobzmwgmdxyixoevee.supabase.co')
 
 TARGET = 120
 MAX_POOL = 200
@@ -199,8 +200,31 @@ def _parse_source(name, body):
     return out
 
 
+def fetch_blacklist():
+    """A3: 读 24h 内被采集器真判死的出口，避免公开源反复捞回当新号。
+    runner 侧凭证缺失或 RPC 异常时优雅降级为空集，不阻断整轮换血。"""
+    key = os.environ.get('SUPABASE_ANON_KEY', '').strip()
+    if not key:
+        return set()
+    try:
+        req = urllib.request.Request(
+            SB_BASE.rstrip('/') + '/rest/v1/rpc/dead_proxy_blacklist',
+            data=json.dumps({'p_hours': 24}).encode(),
+            headers={'apikey': key, 'Authorization': 'Bearer ' + key,
+                     'Content-Type': 'application/json', 'Accept': 'application/json'},
+            method='POST')
+        with urllib.request.urlopen(req, timeout=15) as r:
+            arr = json.loads(r.read().decode() or '[]')
+        bl = set(x for x in arr if isinstance(x, str))
+        log('  [黑名单] 24h 内真判死出口 %d 个，加入 exclude' % len(bl))
+        return bl
+    except Exception as e:
+        log('  [黑名单] 读取失败 %s，本轮不排除（优雅降级）' % type(e).__name__)
+        return set()
+
+
 def fetch_candidates(exclude):
-    cand, seen = [], set(exclude)
+    cand, seen = [], set(exclude) | fetch_blacklist()
     for name, url in SOURCES:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'gk-pool-keeper-runner'})
