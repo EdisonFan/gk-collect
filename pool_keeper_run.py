@@ -153,7 +153,7 @@ def _h(px):
 
 
 def verdict_existing(px, variants):
-    """在池代理：双次确认，OK 优先；两次都非 OK 但有过 THROTTLE 就保留。"""
+    """在池代理：双次确认，OK 优先。A2 后 keep 只收 OK，THROTTLE 剔除（仅计数观察）。"""
     h = _h(px)
     r1 = _probe(px, _body(variants[h % len(variants)]))
     if r1 == 'OK':
@@ -164,6 +164,17 @@ def verdict_existing(px, variants):
     if 'THROTTLE' in (r1, r2):
         return 'THROTTLE'
     return 'DEAD'
+
+
+def verdict_new(px, variants):
+    """A2: 新增候选双次确认（两个不同变体），只收两次都 OK 的号。
+    对齐本地补货口径，避免单次 OK 的抖动号入池。"""
+    h = _h(px)
+    r1 = _probe(px, _body(variants[h % len(variants)]))
+    if r1 != 'OK':
+        return 'DEAD'
+    r2 = _probe(px, _body(variants[(h + 1) % len(variants)]))
+    return 'OK' if r2 == 'OK' else 'DEAD'
 
 
 def _parse_source(name, body):
@@ -243,7 +254,7 @@ def main():
         % (len(pool), TIMEOUT, WORKERS))
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         verdicts = list(ex.map(lambda p: verdict_existing(p, variants), pool))
-    keep = [p for p, v in zip(pool, verdicts) if v in ('OK', 'THROTTLE')]
+    keep = [p for p, v in zip(pool, verdicts) if v == 'OK']
     log('探活结果 %s：保留 %d / 剔除 %d，耗时 %.0fs'
         % (dict(Counter(verdicts)), len(keep), len(pool) - len(keep), time.time() - t0))
 
@@ -259,8 +270,7 @@ def main():
             i += BATCH
             checked += len(batch)
             with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                jobs = [(p, _body(variants[_h(p) % len(variants)])) for p in batch]
-                for (px, _b), r in zip(jobs, ex.map(lambda j: _probe(j[0], j[1]), jobs)):
+                for px, r in zip(batch, ex.map(lambda q: verdict_new(q, variants), batch)):
                     if r == 'OK':
                         added.append(px)
         log('补充结束：验证 %d，可用 %d，耗时 %.0fs'
