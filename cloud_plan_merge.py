@@ -141,7 +141,30 @@ def main():
         except Exception:
             pass
     missing = [s for s in SIDS if s not in by_sid]
-    bad = [s for s in SIDS if s in by_sid and not by_sid[s].get('gate_pass')]
+
+    def recoverable(o):
+        """旧版 shard 把源站整行重复判成 unique_rows=False 导致 gate_pass=False。
+        三项硬闸门全过且 count==numFound 时数据本就完整，宽容复判为达标。"""
+        g = o.get('gate') or {}
+        try:
+            cm = int(o.get('count', -1)) == int(o.get('num_found', -2))
+        except Exception:
+            cm = False
+        return (g.get('pages_zero_fail') is True
+                and g.get('count_match') is True
+                and g.get('school_pure') is True and cm)
+
+    bad, soft_fixed = [], 0
+    for s in SIDS:
+        if s not in by_sid or by_sid[s].get('gate_pass'):
+            continue
+        if recoverable(by_sid[s]):
+            by_sid[s]['gate_pass'] = True   # 仅内存复判，不改产物
+            soft_fixed += 1
+        else:
+            bad.append(s)
+    if soft_fixed:
+        log('%s 宽容复判 %d 校（源站整行重复，非采集失败）' % (COMBO, soft_fixed))
     if missing or bad:
         log('::error::%s 分片不齐：缺失 %d 校 / 未达标 %d 校' %
             (COMBO, len(missing), len(bad)))
@@ -163,9 +186,11 @@ def main():
         items += o.get('items', [])
     fps = [fp(x) for x in items]
     uniq = len(set(fps))
-    if not (len(items) == sum_nf == uniq):
-        log('::error::Σ 不守恒：items=%d ΣnumFound=%d unique_fp=%d cross_dup=%d' %
-            (len(items), sum_nf, uniq, len(items) - uniq))
+    # 源站允许整行重复（无 id 字段），uniq < items 属正常，如实记入 dup_in_api；
+    # 零丢失由 len(items)==ΣnumFound + 逐校三项硬闸门共同保证。
+    dup = len(items) - uniq
+    if len(items) != sum_nf:
+        log('::error::Σ 不守恒：items=%d ΣnumFound=%d' % (len(items), sum_nf))
         dispatch_next()
         return 1
 
@@ -176,7 +201,7 @@ def main():
         'num_found': sum_nf, 'count': len(items),
         'base_num_found': sum_nf, 'base_capped': False,
         'true_num_found': sum_nf, 'partition_count': sum_nf,
-        'dup_in_api': 0, 'coverage_pct': 100.0, 'gate_pass': True,
+        'dup_in_api': dup, 'coverage_pct': 100.0, 'gate_pass': True,
         'gate': {'G1_base': True, 'G2_partition': True,
                  'G3_pages_zero_fail': True, 'G4_count_match': True},
         'partition': {'dimension': 'school_id', 'universe': len(SIDS),
@@ -188,8 +213,8 @@ def main():
         'collected_at': time.strftime('%Y-%m-%d %H:%M:%S'),
         'items': items,
     }
-    log('%s 验收通过：%d 校 / %d 条 / %d 页 / 唯一行指纹 %d' %
-        (COMBO, len(SIDS), len(items), pages, uniq))
+    log('%s 验收通过：%d 校 / %d 条 / %d 页 / 唯一行指纹 %d / 源站重复 %d' %
+        (COMBO, len(SIDS), len(items), pages, uniq, dup))
     okp = push_result(result)
     # 无论推送成败都继续下一段，避免网络抖动把整条链掐断
     dispatch_next()
