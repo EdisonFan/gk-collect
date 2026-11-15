@@ -131,6 +131,8 @@ def main():
         log('::error::%s 分片不齐：缺失 %d 校 / 未达标 %d 校' %
             (COMBO, len(missing), len(bad)))
         log('缺失示例 %s | 未达标示例 %s' % (missing[:12], bad[:12]))
+        # 长链保护：单个组合失败不能卡死后续 100+ 组合，失败组合留待末轮统一重派
+        dispatch_next()
         return 1
 
     import hashlib
@@ -149,6 +151,7 @@ def main():
     if not (len(items) == sum_nf == uniq):
         log('::error::Σ 不守恒：items=%d ΣnumFound=%d unique_fp=%d cross_dup=%d' %
             (len(items), sum_nf, uniq, len(items) - uniq))
+        dispatch_next()
         return 1
 
     result = {
@@ -173,8 +176,8 @@ def main():
     log('%s 验收通过：%d 校 / %d 条 / %d 页 / 唯一行指纹 %d' %
         (COMBO, len(SIDS), len(items), pages, uniq))
     okp = push_result(result)
-    if okp:
-        dispatch_next()
+    # 无论推送成败都继续下一段，避免网络抖动把整条链掐断
+    dispatch_next()
     return 0 if okp else 1
 
 
