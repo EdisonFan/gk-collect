@@ -105,11 +105,26 @@ def dispatch_next():
         'Content-Type': 'application/json',
         'User-Agent': 'cb'}, method='POST')
     try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            log('已派发下一组合 %s (HTTP %s)，剩余队列 %s' %
-                (nxt, r.status, rest or '无'))
+        # 长链串行 dispatch 185 次，任何一次网络抖动丢包都会掐断后续全部组合；
+        # 派发必须重试，且 204/201 都视为成功（GitHub 对 dispatch 返回 204）。
+        last = None
+        for i in range(1, 4):
+            try:
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    log('已派发下一组合 %s (HTTP %s)，剩余队列 %d 组合' %
+                        (nxt, r.status, len(chain) - 1))
+                    break
+            except Exception as e:
+                last = e
+                log('::warning::派发 %s 第 %d 次失败: %s' %
+                    (nxt, i, str(e)[:120]))
+                if i < 3:
+                    time.sleep(4 * i)
+        else:
+            log('::error::派发 %s 连续 3 次失败，链条可能中断，需人工补派: %s' %
+                (nxt, str(last)[:150]))
     except Exception as e:
-        log('::warning::派发下一组合 %s 失败: %s' % (nxt, str(e)[:150]))
+        log('::error::派发准备异常 %s' % str(e)[:150])
 
 
 def main():
