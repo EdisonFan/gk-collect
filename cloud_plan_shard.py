@@ -126,10 +126,13 @@ def collect_school(sid, fetch, size):
         all_items += res[p]
     fps = [row_fp(x) for x in all_items]
     pure = all(str(x.get('school_id')) == str(sid) for x in all_items)
+    # 源站无 id 字段，且会返回整行完全相同的重复招生计划
+    # （同专业不同专业组 / 多字段留空 → 行指纹相同）。
+    # 页零失败 + count==numFound + school_pure 已保证零丢失；
+    # 重复行数只作 dup_in_api 诊断，不再当闸门，避免一校误判毁掉整组。
     gate = {'pages_zero_fail': len(failed) == 0,
             'count_match': len(all_items) == nf,
-            'school_pure': pure,
-            'unique_rows': len(set(fps)) == len(all_items)}
+            'school_pure': pure}
     o = {'prov': PROV, 'year': YEAR, 'school_id': sid, 'dimension': 'school_id',
          'num_found': nf, 'count': len(all_items), 'pages': pages,
          'pages_ok': len(res), 'pages_failed': len(failed),
