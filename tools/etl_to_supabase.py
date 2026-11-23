@@ -147,8 +147,30 @@ def _req(url, data=None, headers=None, method=None, retries=5):
 
 
 def upsert(table, rows, conflict=None):
+    """PostgREST upsert（幂等）。
+
+    两个坑：
+    1) on_conflict 必须是 URL query 参数，塞进 Prefer 头会被忽略并退化成按主键 upsert。
+    2) PostgreSQL 的 ON CONFLICT DO UPDATE 不允许「同一批次内」出现重复冲突键
+       (500: "ON CONFLICT DO UPDATE command cannot affect row a second time")。
+       因此插入前必须按最终唯一键做批内去重。
+    """
     if not rows:
         return 0
+    if conflict:
+        cols = conflict.split(',')
+        seen = set()
+        dedup = []
+        for r in rows:
+            k = tuple(str(r.get(c, '')) for c in cols)
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup.append(r)
+        if len(dedup) != len(rows):
+            print('    [去重] %s 批内 %d -> %d 行（重复唯一键）' % (
+                table, len(rows), len(dedup)), flush=True)
+        rows = dedup
     url = '%s/%s' % (SB_URL, table)
     if conflict:
         url += '?on_conflict=' + conflict
@@ -212,14 +234,23 @@ def plan_rows(items, prov, year):
             rr = 'UNLIMITED'
         elif raw:
             rr = 'OTHER'
-        k = (prov, year, uk, '', req_code or raw)
+        # requirement_code 必须与「批内唯一键」一致，否则 PostgreSQL 会报
+        # "ON CONFLICT DO UPDATE command cannot affect row a second time"。
+        # 真实冲突形态（2026-11-23 实测 77868 行）：同一专业组内不同专业有不同选科
+        # 要求（组 102 里既有「再选化学」也有「再选不限」），而平台 encoding 为空，
+        # 去重键若用 raw、插入列若用 ''，二者不一致就撞唯一索引。
+        # 修法：encoding 为空时用 raw 的 sha1 摘要占位（确定性、唯一、不丢信息）。
+        rc = req_code
+        if not rc:
+            rc = ('T' + hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]) if raw else ''
+        k = (prov, year, uk, '', rc)
         if k in subreq_by_unit:
             continue
         subreq_by_unit[k] = len(subreq_rows) + 1
         subreq_rows.append({
             'region_code': prov, 'year': year, 'school_code': sid, 'unit_key': uk,
             'major_code': '', 'first_subject': fs, 'recheck_rule': rr,
-            'recheck_subjects': None, 'requirement_code': req_code,
+            'recheck_subjects': None, 'requirement_code': rc,
             'raw_text': raw[:255], 'source': 'gaokao.cn/gkv3/plan/school',
             'data_version': str(year),
         })
@@ -317,14 +348,15 @@ def process(kind, combo, workdir='/tmp/etl_work'):
                 upsert('subject_requirement', subs[i:i + BATCH_SIZE],
                        conflict='region_code,year,unit_key,major_code,requirement_code')
             print('  T05 upsert %d' % len(subs), flush=True)
-        # 回填 subject_req_id：按 (prov,year,unit_key) 建立 unit_key -> id 映射
+        # 回填 subject_req_id：按 unit_key 建立 id 映射（一个 unit_key 可能对应
+        # 多条不同选科要求的 T05 行，取第一条作为该计划行的引用）。
         q = ('subject_requirement?select=id,unit_key'
              '&region_code=eq.%s&year=eq.%s' % (prov, year))
         try:
             raw = _req('%s/%s' % (SB_URL, q))
             id_by_unit = {}
             for r in json.loads(raw):
-                id_by_unit[r['unit_key']] = r['id']
+                id_by_unit.setdefault(r['unit_key'], r['id'])
         except Exception as e:
             print('  [warn] 回填查询失败:', str(e)[:140], flush=True)
             id_by_unit = {}
