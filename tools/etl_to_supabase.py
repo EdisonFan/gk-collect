@@ -29,6 +29,146 @@ CAT_MAP = {
 }
 
 
+# ---- 选科要求解析（与 subject_req_parser.py 同一实现，内联避免云端多文件依赖）----
+# -*- coding: utf-8 -*-
+"""选科要求明文 -> (first_subject, recheck_rule, recheck_subjects)
+
+按 sys_dict_data(dict_type='gk_recheck_rule') 的值域解析：
+  UNLIMITED     不限
+  CHEM_REQUIRED 必选化学
+  CHOOSE_1_OF_2 二选一
+  CHOOSE_2_OF_3 三选二
+  OTHER         其他
+
+原 build_basic_data.py 的粗判（'化学' in raw -> CHEM_REQUIRED）会把
+「物理/化学(2选1)」「化学/生物(2选1)」误判成「必选化学」——这会让选科过滤
+错误剔除合法考生（静默失效，最危险的一类错误）。本模块按明文语义精确解析。
+
+先科编码对照（掌上高考 sp_xuanke / sg_fxk 里的数字）：
+  70001 物理  70002 历史  70003 思想政治  70004 地理
+  70005 生物  70006 化学
+"""
+import re
+
+# 科目名 -> 平台编码
+SUBJ_CODE = {
+    '物理': '70001', '历史': '70002', '思想政治': '70003', '政治': '70003',
+    '地理': '70004', '生物': '70005', '化学': '70006',
+}
+# 常见缩写单字（北京等省份的「物/化/生(3选1)」这类写法）
+SUBJ_ALIAS = {
+    '物': '物理', '化': '化学', '生': '生物',
+    '史': '历史', '政': '思想政治', '地': '地理',
+}
+CODE_SUBJ = {v: k for k, v in SUBJ_CODE.items()}
+# 归一科目名（思想政治 与 政治 同义）
+_SUBJ_ALIAS = {'政治': '思想政治'}
+
+
+def _norm_subject(name):
+    n = (name or '').strip()
+    return _SUBJ_ALIAS.get(n, n)
+
+
+def parse_subject_requirement(raw):
+    """解析选科要求明文。
+
+    返回 (first_subject, recheck_rule, recheck_subjects)
+      first_subject     'PHYSICS' / 'HISTORY' / 'UNLIMITED'
+      recheck_rule      'UNLIMITED' / 'CHEM_REQUIRED' / 'CHOOSE_1_OF_2'
+                        / 'CHOOSE_2_OF_3' / 'OTHER'
+      recheck_subjects  list[str]，再选科目编码数组（[] 表示不限）
+    """
+    text = (raw or '').strip()
+    if not text or text in ('不限', '无限制', '不提科目要求'):
+        return 'UNLIMITED', 'UNLIMITED', []
+
+    # 拆「首选X，再选Y」/「首选X」两段
+    first = 'UNLIMITED'
+    recheck_part = text
+    m = re.match(r'^首选\s*([^，,]+)\s*[，,]\s*(.+)$', text)
+    if m:
+        first_txt, recheck_part = m.group(1), m.group(2)
+        for name in ('物理', '历史'):
+            if name in first_txt:
+                first = 'PHYSICS' if name == '物理' else 'HISTORY'
+                break
+    else:
+        m2 = re.match(r'^首选\s*([^，,]+)$', text)
+        if m2:
+            first_txt = m2.group(1)
+            recheck_part = ''
+            for name in ('物理', '历史'):
+                if name in first_txt:
+                    first = 'PHYSICS' if name == '物理' else 'HISTORY'
+                    break
+
+    rp = (recheck_part or '').strip()
+    if not rp:
+        return first, 'UNLIMITED', []
+
+    if '不限' in rp:
+        return first, 'UNLIMITED', []
+
+    # 拆出「N选M」结构：中文数字或阿拉伯数字
+    pick = re.search(r'(\d+)\s*选\s*(\d+)', rp)
+    n_sel, m_need = (int(pick.group(1)), int(pick.group(2))) if pick else (None, None)
+
+    # 提取科目列表：按「、」「/」「或」「和」分隔
+    subj_part = rp
+    if pick:
+        subj_part = rp[:pick.start()] + rp[pick.end():]
+    # 去掉「(2科必选)」「（2科必选）」这类括号说明
+    subj_part = re.sub(r'[（(][^）)]*[）)]', '', subj_part)
+    subj_part = re.sub(r'(再选|必选|选考|不限科目要求)', '', subj_part)
+    parts = re.split(r'[、,/或和及]|与', subj_part)
+    subjects = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        hit = None
+        for name in ('物理', '历史', '思想政治', '政治', '地理', '生物', '化学'):
+            if name in p:
+                hit = name
+                break
+        if hit is None:
+            # 缩写单字：物/化/生/史/政/地（需长度==1，避免误伤）
+            for short, full in SUBJ_ALIAS.items():
+                if short in p and len(p) <= 2:
+                    hit = full
+                    break
+        if hit:
+            nn = _norm_subject(hit)
+            if nn not in subjects:
+                subjects.append(nn)
+    codes = [SUBJ_CODE[s] for s in subjects if s in SUBJ_CODE]
+
+    # 判定规则（recheck_rule 只用字典值域；具体科目靠 recheck_subjects 承载）
+    if n_sel and m_need:
+        if n_sel == 2 and m_need == 1:
+            rule = 'CHOOSE_1_OF_2'
+        elif n_sel == 3 and m_need == 2:
+            rule = 'CHOOSE_2_OF_3'
+        else:
+            rule = 'OTHER'
+    elif subjects == ['化学']:
+        rule = 'CHEM_REQUIRED'
+    elif len(subjects) == 1:
+        # 单科必选但不是化学（地理/生物/思想政治等）：
+        # 字典无对应值 -> OTHER，具体科目见 recheck_subjects
+        rule = 'OTHER'
+    elif subjects:
+        # 列了多科但没写选几 -> 语义不明 -> OTHER（codes 已承载科目信息）
+        rule = 'OTHER'
+    else:
+        rule = 'OTHER'
+
+    return first, rule, codes
+
+
+
+
 def cat_of(s):
     return CAT_MAP.get((s or '').strip(), '综合')
 
@@ -281,17 +421,10 @@ def plan_rows(items, prov, year):
         raw = str(x.get('sp_info') or x.get('sg_info') or '').strip()
         if not req_code and not raw:
             continue
-        fs, rr = 'UNLIMITED', 'UNLIMITED'
-        if '物理' in raw:
-            fs = 'PHYSICS'
-        elif '历史' in raw:
-            fs = 'HISTORY'
-        if '化学' in raw:
-            rr = 'CHEM_REQUIRED'
-        elif '不限' in raw:
-            rr = 'UNLIMITED'
-        elif raw:
-            rr = 'OTHER'
+        # 选科要求语义解析（精确区分「必选化学」/「二选一」/「三选二」）。
+        # 原粗判 '化学' in raw 会把「物理/化学(2选1)」误判成必选化学，
+        # 导致选科过滤错误剔除合法考生 —— 静默失效，必须精确。
+        fs, rr, subj_codes = parse_subject_requirement(raw)
         # requirement_code 必须与「批内唯一键」一致，否则 PostgreSQL 会报
         # "ON CONFLICT DO UPDATE command cannot affect row a second time"。
         # 真实冲突形态（2026-11-23 实测 77868 行）：同一专业组内不同专业有不同选科
@@ -308,7 +441,9 @@ def plan_rows(items, prov, year):
         subreq_rows.append({
             'region_code': prov, 'year': year, 'school_code': sid, 'unit_key': uk,
             'major_code': '', 'first_subject': fs, 'recheck_rule': rr,
-            'recheck_subjects': None, 'requirement_code': rc,
+            'recheck_subjects': (json.dumps(subj_codes, ensure_ascii=False)
+                                  if subj_codes else None),
+            'requirement_code': rc,
             'raw_text': raw[:255], 'source': 'gaokao.cn/gkv3/plan/school',
             'data_version': str(year),
         })
