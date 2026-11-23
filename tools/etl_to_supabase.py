@@ -220,6 +220,12 @@ def plan_rows(items, prov, year):
         mode = mode_of(prov, year)
         uk = unit_key(mode, prov, year, cat, batch, sid, group, major, ptype, detail)
         req_code = str(x.get('sp_fxk') or x.get('sp_xuanke') or '').strip()
+        # 专业级编码缺失时回退到专业组级编码 sg_fxk。
+        # 实测 44-2024：sp_fxk 在 25152 行里仅 1 行有值，而 sg_fxk 100% 有值
+        # （70000=物理类 / 70004=历史类）。sg_fxk 是「首选科目」级别，
+        # 再选科目的差异靠 sg_info 明文区分（明文有 5 种，编码只有 2 种）。
+        if not req_code:
+            req_code = str(x.get('sg_fxk') or '').strip()
         raw = str(x.get('sp_info') or x.get('sg_info') or '').strip()
         if not req_code and not raw:
             continue
@@ -350,16 +356,31 @@ def process(kind, combo, workdir='/tmp/etl_work'):
             print('  T05 upsert %d' % len(subs), flush=True)
         # 回填 subject_req_id：按 unit_key 建立 id 映射（一个 unit_key 可能对应
         # 多条不同选科要求的 T05 行，取第一条作为该计划行的引用）。
-        q = ('subject_requirement?select=id,unit_key'
-             '&region_code=eq.%s&year=eq.%s' % (prov, year))
+        #
+        # 关键：PostgREST 单次查询默认最多返回 1000 行，超过就静默截断 ——
+        # 实测 44-2024 的 T05 有 7714 行，不分页则只有前 1000 行进映射，
+        # 回填率从 100% 掉到 13.7%。这里显式分页拉全。
+        id_by_unit = {}
         try:
-            raw = _req('%s/%s' % (SB_URL, q))
-            id_by_unit = {}
-            for r in json.loads(raw):
-                id_by_unit.setdefault(r['unit_key'], r['id'])
+            page = 0
+            while True:
+                q = ('subject_requirement?select=id,unit_key'
+                     '&region_code=eq.%s&year=eq.%s'
+                     '&order=id&limit=1000&offset=%d' % (prov, year, page * 1000))
+                raw = _req('%s/%s' % (SB_URL, q))
+                rows = json.loads(raw)
+                if not rows:
+                    break
+                for r in rows:
+                    id_by_unit.setdefault(r['unit_key'], r['id'])
+                if len(rows) < 1000:
+                    break
+                page += 1
+                if page > 50:
+                    break
+            print('  T05 id 映射 %d unit_key（%d 页）' % (len(id_by_unit), page + 1), flush=True)
         except Exception as e:
             print('  [warn] 回填查询失败:', str(e)[:140], flush=True)
-            id_by_unit = {}
         hit = 0
         for p in plans:
             sid_ = id_by_unit.get(p['unit_key'])
