@@ -349,6 +349,10 @@ def process(kind, combo, workdir='/tmp/etl_work'):
 
     if kind == 'plan':
         plans, subs = plan_rows(items, prov, year)
+        # 诊断：源行数与去重后行数的差异（plan_key 去重会合并完全相同的行）
+        if len(plans) != len(items):
+            print('  [诊断] 源 %d 行 -> 去重后 T06 %d 行（合并 %d 条同键行）' % (
+                len(items), len(plans), len(items) - len(plans)), flush=True)
         if subs:
             for i in range(0, len(subs), BATCH_SIZE):
                 upsert('subject_requirement', subs[i:i + BATCH_SIZE],
