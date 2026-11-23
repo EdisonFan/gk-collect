@@ -1,39 +1,31 @@
 # GitHub  EdisonFan/gk-collect
 #   → CNB  cooledi/gk-collect   完整 1:1 镜像（CNB 侧只读）
 #
-# 用法：放到 GitHub 仓库的 .github/workflows/sync-to-cnb.yml
-#
 # 设计要点（针对本项目，勿删）：
 #   1. CNB_REPO 与 GitHub repo 同名 gk-collect；组名 cooledi ≠ owner EdisonFan，须写死
-#   2. 完整镜像：main + 全部 cutoff-* / special-* 分支，--force --prune 保持逐 ref 一致
-#      —— CNB 侧不单独维护内容，GitHub 是唯一真源
-#   3. 触发三通道：
-#      - workflow_run：采集 run 整批 completed 时触发（覆盖云端采集器用
-#        GITHUB_TOKEN 推分支，GitHub 防递归规则不触发 push 的场景）
-#      - push：本地采集器用 PAT 推结果分支会触发，on.push 必须覆盖结果分支
-#      - schedule 定时兜底：一批 10 个 job 常跑数小时，先完成的 job 推的
-#        分支在整批 completed 之前没有 workflow_run，也不触发 push，
-#        成为同步孤儿（2026-11-12 实测 special-41-2021 因此缺 65 分钟，
-#        L4 抓到）。定时全量镜像把「批次未收口」期间的缺口也兜住。
+#   2. 完整 1:1 镜像：main + 全部 plan-* / cutoff-* / special-* / local-share-* 分支，
+#      --force --prune 逐 ref 对齐 —— CNB 侧不单独维护内容，GitHub 是唯一真源
+#   3. 触发红线（用户明确）：仅 workflow_dispatch 手动派发，不设任何定时触发。
+#      采集已全部收官，无需 workflow_run / push 自动兜底。
 #   4. 显式 fetch 全部分支再推，避免 checkout 只拉当前分支导致漏推
-#   5. main 变更（归档/代码更新）与结果分支推送均由 on.push 直接触发镜像
+#   5. branches 入参用于试点：只推指定分支；留空 = 全量 1:1
 
 name: Sync gk-collect to CNB (1:1)
 
 on:
-  workflow_run:
-    workflows: ['gk-cutoff', 'gk-special']
-    types: [completed]
-  push:
-    branches: ['main', 'cutoff-*', 'special-*']
-  schedule:                  # 兜底：批次未收口期间推的分支也能进 CNB
-    - cron: '*/10 * * * *'
-  workflow_dispatch:         # 手动补一次同步
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: '逗号分隔分支名(试点)；留空=全量1:1'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   mirror:
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     permissions:
       contents: read
     concurrency:
@@ -44,22 +36,46 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Full mirror to CNB
+      - name: 检查 CNB_TOKEN
         env:
           CNB_TOKEN: ${{ secrets.CNB_TOKEN || secrets.CNB__TOKEN }}
-          CNB_REPO: cooledi/gk-collect
+        run: |
+          [ -n "$CNB_TOKEN" ] || { echo "::error::未配置 CNB_TOKEN"; exit 1; }
+          echo "CNB_TOKEN 已配置"
+
+      - name: 试点——仅推指定分支
+        if: ${{ inputs.branches != '' }}
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN || secrets.CNB__TOKEN }}
+          BRANCHES: ${{ inputs.branches }}
         run: |
           set -euo pipefail
-          if [ -z "${CNB_TOKEN}" ]; then
-            echo "::error::未配置 CNB_TOKEN，请在 Settings → Secrets and variables → Actions 添加"
-            exit 1
-          fi
+          git config --global http.postBuffer 524288000
+          git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/cooledi/gk-collect.git"
+          IFS=',' read -ra ARR <<< "$BRANCHES"
+          ok=0; fail=0
+          for b in "${ARR[@]}"; do
+            b="$(echo "$b" | xargs)"
+            [ -z "$b" ] && continue
+            echo "=== 试点 $b ==="
+            git fetch -q --no-tags origin "refs/heads/$b:refs/remotes/origin/$b" || { echo "拉取失败 $b"; fail=$((fail+1)); continue; }
+            git push cnb "refs/remotes/origin/$b:refs/heads/$b" --force && ok=$((ok+1)) || { echo "推送失败 $b"; fail=$((fail+1)); }
+          done
+          echo "试点完成: ok=$ok fail=$fail"
+          [ "$fail" -eq 0 ] || exit 1
+
+      - name: 全量 1:1 镜像
+        if: ${{ inputs.branches == '' }}
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN || secrets.CNB__TOKEN }}
+        run: |
+          set -euo pipefail
           git config --global http.postBuffer 524288000
           git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
-          git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}.git"
-          # 完整镜像 main + 全部结果分支（投档线 cutoff-* / 专业线 special-*）
-          # --prune 清掉 CNB 上源站已删的分支
-          git push --force --prune cnb \
-            '+refs/remotes/origin/main:refs/heads/main' \
-            '+refs/remotes/origin/cutoff-*:refs/heads/cutoff-*' \
-            '+refs/remotes/origin/special-*:refs/heads/special-*'
+          git branch -rd origin/HEAD 2>/dev/null || true
+          git remote add cnb "https://cnb:${CNB_TOKEN}@cnb.cool/cooledi/gk-collect.git"
+          echo "GitHub 分支数: $(git for-each-ref --format='%(refname:short)' refs/remotes/origin | wc -l)"
+          echo "=== 全量 1:1 推送(含 --prune 清理多余分支) ==="
+          git push --force --prune cnb '+refs/remotes/origin/*:refs/heads/*'
+          echo "=== 完成，最终核验 ==="
+          echo "CNB 分支数: $(git ls-remote --heads cnb | wc -l)"
