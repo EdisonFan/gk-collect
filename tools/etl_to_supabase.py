@@ -121,6 +121,49 @@ GH_TOKEN = os.environ.get('GH_TOKEN', '').strip()
 REPO = 'EdisonFan/gk-collect'
 BATCH_SIZE = 500
 
+# 各表列宽（与建表 DDL 一致）。用于插入前的长度守卫 —— PostgreSQL 对 varchar
+# 超长直接报错（22001），且报错信息不含列名，只能靠本地预检兜住。
+COL_WIDTH = {
+    'subject_requirement': {
+        'region_code': 12, 'year': 6, 'school_code': 16, 'unit_key': 96,
+        'major_code': 16, 'first_subject': 12, 'recheck_rule': 24,
+        'requirement_code': 24, 'raw_text': 255, 'source': 64, 'data_version': 32,
+    },
+    'enrollment_plan': {
+        'plan_key': 160, 'unit_key': 96, 'region_code': 12, 'year': 6,
+        'category': 24, 'batch': 40, 'school_code': 16, 'school_name': 120,
+        'group_code': 32, 'group_name': 120, 'major_code': 24, 'major_name': 200,
+        'major_note': 500, 'program_note': 500, 'plan_type': 24,
+        'plan_type_detail': 64, 'campus': 120, 'status': 12, 'source': 64,
+        'data_version': 32,
+    },
+    'admission_cutoff': {
+        'unit_key': 96, 'region_code': 12, 'year': 6, 'category': 24, 'batch': 40,
+        'school_code': 16, 'school_name': 120, 'group_code': 32, 'group_name': 120,
+        'plan_type': 24, 'plan_type_detail': 64, 'subject_req_raw': 255,
+        'source': 64, 'data_version': 32,
+    },
+    'special_plan': {
+        'plan_type': 32, 'region_code': 12, 'year': 6, 'school_code': 16,
+        'admit_rule': 500, 'volunteer_mode': 20, 'source': 64, 'data_version': 32,
+    },
+}
+
+
+def clamp_rows(table, rows):
+    """按列宽截断字符串列（超长则截断并保留前缀，保证可读与确定性）。"""
+    widths = COL_WIDTH.get(table)
+    if not widths:
+        return rows, 0
+    n = 0
+    for r in rows:
+        for k, w in widths.items():
+            v = r.get(k)
+            if isinstance(v, str) and len(v) > w:
+                r[k] = v[:w]
+                n += 1
+    return rows, n
+
 
 def _req(url, data=None, headers=None, method=None, retries=5):
     h = {'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY}
@@ -157,6 +200,9 @@ def upsert(table, rows, conflict=None):
     """
     if not rows:
         return 0
+    rows, clamped = clamp_rows(table, rows)
+    if clamped:
+        print('    [截断] %s %d 个超长字段已按列宽截断' % (table, clamped), flush=True)
     if conflict:
         cols = conflict.split(',')
         seen = set()
@@ -226,6 +272,12 @@ def plan_rows(items, prov, year):
         # 再选科目的差异靠 sg_info 明文区分（明文有 5 种，编码只有 2 种）。
         if not req_code:
             req_code = str(x.get('sg_fxk') or '').strip()
+        # 长度守卫：requirement_code 列是 VARCHAR(24)。
+        # 北京的 sp_xuanke 是「首选+再选的所有合法组合」枚举串，最长 269 字符
+        # （实测 11-2023），远超列宽。明文已存在 raw_text / sp_info 里，
+        # 这里用 sha1 摘要占位，既不丢信息又保证唯一。
+        if len(req_code) > 24:
+            req_code = 'X' + hashlib.sha1(req_code.encode('utf-8')).hexdigest()[:23]
         raw = str(x.get('sp_info') or x.get('sg_info') or '').strip()
         if not req_code and not raw:
             continue
