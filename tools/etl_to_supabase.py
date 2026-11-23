@@ -587,7 +587,8 @@ def process(kind, combo, workdir='/tmp/etl_work'):
     if kind == 'cutoff':
         rows = cutoff_rows(items, prov, year)
         for i in range(0, len(rows), BATCH_SIZE):
-            upsert('admission_cutoff', rows[i:i + BATCH_SIZE])
+            upsert('admission_cutoff', rows[i:i + BATCH_SIZE],
+                   conflict='unit_key,region_code,year,category,batch,school_code,group_code,plan_type,plan_type_detail')
         print('  T08 upsert %d' % len(rows), flush=True)
         return {'combo': combo, 'cutoff': len(rows)}
 
