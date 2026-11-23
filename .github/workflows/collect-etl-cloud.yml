@@ -1,0 +1,104 @@
+name: gk-etl-supabase
+run-name: "ETL 灌库 ${{ inputs.kind }} ${{ inputs.combo || 'all' }}"
+
+# 触发红线（2026-11-14 用户明确）：本工作流绝不写 schedule: / cron。
+# 本工作流不做「采集」——只把已采完的分支数据 ETL 后灌进 Supabase，
+# 但同样只接受 workflow_dispatch 手动派发，不定时发起。
+#
+# 存在理由：本地到 GitHub raw 只有 ~42KB/s，4.5GB 分支数据要 30+ 小时；
+# Actions runner 与 GitHub 同机房，实测拉取快 3 个数量级，且直连 Supabase。
+#
+# 幂等：全部走 PostgREST upsert（on_conflict 指定自然键），可任意重跑。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: '数据类型'
+        required: true
+        type: choice
+        options:
+          - plan
+          - cutoff
+      combo:
+        description: '单个组合 prov-year，如 44-2024；留空 = 全量 186 组合'
+        required: false
+        type: string
+        default: ''
+      start:
+        description: '起始索引(0-based)，用于分批推进'
+        required: false
+        type: string
+        default: '0'
+      count:
+        description: '本批处理组合数'
+        required: false
+        type: string
+        default: '186'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gk-etl-${{ inputs.kind }}
+  cancel-in-progress: false
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        combo: ${{ fromJSON(needs.plan_matrix.outputs.matrix) }}
+    needs: plan_matrix
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: ETL 灌库 ${{ matrix.combo }}
+        env:
+          KIND: ${{ inputs.kind }}
+          COMBO: ${{ matrix.combo }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/etl
+          # ETL 脚本随仓库一起走（放在 tools/ 目录）
+          python3 tools/etl_to_supabase.py --kind "$KIND" --combo "$COMBO" --workdir /tmp/etl
+
+  plan_matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - id: gen
+        env:
+          KIND: ${{ inputs.kind }}
+          COMBO: ${{ inputs.combo }}
+          START: ${{ inputs.start }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          set -euo pipefail
+          if [ -n "$COMBO" ]; then
+            echo "matrix=[\"$COMBO\"]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 全部省 × 年组合（31 省 × 6 年）
+          PROVS="11 12 13 14 15 21 22 23 31 32 33 34 35 36 37 41 42 43 44 45 46 50 51 52 53 54 61 62 63 64 65"
+          YEARS="2021 2022 2023 2024 2025 2026"
+          ALL=""
+          for p in $PROVS; do for y in $YEARS; do ALL="$ALL\"$p-$y\","; done; done
+          ALL="[${ALL%,}]"
+          # 按 START/COUNT 切片
+          SLICE=$(python3 -c "
+          import json,sys
+          a=json.loads('''$ALL''')
+          s=int('$START'); c=int('$COUNT')
+          print(json.dumps(a[s:s+c]))
+          ")
+          echo "matrix=$SLICE" >> "$GITHUB_OUTPUT"
+          echo "本批组合数: $(python3 -c "import json;print(len(json.loads('''$SLICE''')))")"
