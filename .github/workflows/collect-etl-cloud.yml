@@ -20,6 +20,7 @@ on:
         options:
           - plan
           - cutoff
+          - special
       combo:
         description: '单个组合 prov-year，如 44-2024；留空 = 全量 186 组合'
         required: false
