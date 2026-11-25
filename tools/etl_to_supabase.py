@@ -287,6 +287,13 @@ COL_WIDTH = {
         'plan_type': 32, 'region_code': 12, 'year': 6, 'school_code': 16,
         'admit_rule': 500, 'volunteer_mode': 20, 'source': 64, 'data_version': 32,
     },
+    'major_admission': {
+        'plan_key': 180, 'region_code': 12, 'year': 6, 'category': 24, 'batch': 40,
+        'school_code': 16, 'school_name': 120, 'group_code': 32, 'major_code': 24,
+        'major_name': 200, 'catalog_l1': 64, 'catalog_l2': 64,
+        'plan_type': 24, 'plan_type_detail': 64, 'remark': 220,
+        'source': 64, 'data_version': 32,
+    },
 }
 
 
@@ -370,8 +377,10 @@ def fetch_branch_file(kind, combo, out_path):
     prov, year = combo.split('-')
     if kind == 'plan':
         br, path = 'plan-' + combo, 'out/plan_%s_%s.json' % (prov, year)
-    else:
+    elif kind == 'cutoff':
         br, path = 'cutoff-' + combo, 'out/cutoff_%s_%s.json' % (prov, year)
+    else:  # special -> T09 major_admission
+        br, path = 'special-' + combo, 'out/special_%s_%s.json' % (prov, year)
     url = 'https://raw.githubusercontent.com/%s/%s/%s' % (REPO, br, path)
     hdr = {'Authorization': 'Bearer ' + GH_TOKEN} if GH_TOKEN else {}
     for attempt in range(10):
@@ -492,6 +501,51 @@ def plan_rows(items, prov, year):
     return plans, subreq_rows
 
 
+def major_admission_rows(items, prov, year):
+    """T09 专业录取线：special-* 分支的 items 实为院校专业录取明细
+    （min/min_section/sp_name/level2_name/sg_fxk/school_id），非专项计划。
+    字段映射严格复用 plan_rows 的 cat_of/batch_of/ptype_of/group_of/plan_key 口径。
+    """
+    out = []
+    seen = set()
+    for x in items:
+        cat = cat_of(x.get('local_type_name'))
+        batch = batch_of(x.get('local_batch_name'))
+        ptype = ptype_of(x.get('zslx_name'))
+        detail = (x.get('zslx_name') or '').strip()
+        group = group_of(x.get('sg_name'))
+        major = (x.get('sp_scode') or '').strip()
+        major = '' if major in ('-',) else major
+        mname = (x.get('sp_name') or '').strip()[:200]
+        sid = str(x.get('school_id') or '')
+        prog = str(x.get('info') or x.get('spname') or '').strip()
+
+        def iv(v):
+            if isinstance(v, (int, float)) and v not in (-1, 9999):
+                return int(v)
+            return None
+
+        pk = plan_key(prov, year, cat, batch, sid, group, major, ptype, detail, prog, mname)
+        # 批内去重（与库唯一键一致）
+        uk = (prov, year, sid, major, group, detail)
+        if uk in seen:
+            continue
+        seen.add(uk)
+        out.append({
+            'plan_key': pk, 'region_code': prov, 'year': year,
+            'category': cat, 'batch': batch, 'school_code': sid,
+            'school_name': str(x.get('name') or '')[:120], 'group_code': group,
+            'major_code': major, 'major_name': mname,
+            'catalog_l1': str(x.get('level2_name') or '')[:64],
+            'catalog_l2': str(x.get('level3_name') or '')[:64],
+            'min_score': iv(x.get('min')), 'min_rank': iv(x.get('min_section')),
+            'plan_type': ptype, 'plan_type_detail': detail,
+            'remark': str(x.get('info') or x.get('spname') or '')[:220],
+            'source': 'gaokao.cn/gk/score/special', 'data_version': str(year),
+        })
+    return out
+
+
 def cutoff_rows(items, prov, year):
     out = []
     for x in items:
@@ -592,12 +646,20 @@ def process(kind, combo, workdir='/tmp/etl_work'):
         print('  T08 upsert %d' % len(rows), flush=True)
         return {'combo': combo, 'cutoff': len(rows)}
 
+    if kind == 'special':
+        rows = major_admission_rows(items, prov, year)
+        for i in range(0, len(rows), BATCH_SIZE):
+            upsert('major_admission', rows[i:i + BATCH_SIZE],
+                   conflict='region_code,year,school_code,major_code,group_code,plan_type_detail')
+        print('  T09 upsert %d' % len(rows), flush=True)
+        return {'combo': combo, 'major_admission': len(rows)}
+
     return {'combo': combo}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--kind', required=True, choices=['plan', 'cutoff'])
+    ap.add_argument('--kind', required=True, choices=['plan', 'cutoff', 'special'])
     ap.add_argument('--combo', required=True)
     ap.add_argument('--workdir', default='/tmp/etl_work')
     a = ap.parse_args()
